@@ -42,7 +42,7 @@ DEFAULT_MODEL = os.environ.get('MODEL_PATH', '/home/asher/.lmstudio/models/lmstu
 SHUTDOWN_TOKEN = os.environ.get('LLM_SHUTDOWN_TOKEN')
 HOST = os.environ.get('LLM_HOST', '0.0.0.0')
 PORT = int(os.environ.get('LLM_PORT', '5005'))
-GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', 'gemini-3-flash-preview')
+GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash-lite')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 app = FastAPI()
@@ -60,7 +60,7 @@ class AskRequest(BaseModel):
     system_prompt: Optional[str] = None
     generation_params: Optional[Dict[str, Any]] = None
     conversation: Optional[List[Dict[str, str]]] = None
-    provider: Optional[str] = 'gemini-3-flash-preview' # 'local', 'gemini-3-flash-preview', 'gemini-2.5-flash'
+    provider: Optional[str] = 'gemini-2.5-flash-lite' # 'local', 'gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemma-3-27b'
 
 class AskResponse(BaseModel):
     response: str
@@ -105,7 +105,7 @@ def startup_event():
     if genai and gemini_key:
         try:
             genai.configure(api_key=gemini_key.strip())
-            # Default to gemini-3-flash-preview
+            # Default to gemini-2.5-flash-lite
             app.state.gemini_model_name = GEMINI_MODEL_NAME
             app.state.gemini_model = genai.GenerativeModel(app.state.gemini_model_name)
             logging.info('Gemini API initialized successfully with %s', app.state.gemini_model_name)
@@ -150,9 +150,11 @@ def index():
         <form id="frm">
             <label>Provider</label><br>
             <select id="provider" style="width:100%; margin-bottom:10px; padding:4px;">
-                <option value="gemini-3-flash-preview" selected>Google Gemini 3 Flash Preview</option>
+                <option value="gemini-3-flash-preview">Google Gemini 3 Flash Preview</option>
                 <option value="gemini-2.5-flash">Google Gemini 2.5 Flash</option>
-                <option value="local">Local Model (Llama/Gemma)</option>
+                <option value="gemini-2.5-flash-lite" selected>Google Gemini 2.5 Flash Lite (Unlimited!)</option>
+                <option value="gemma-3-27b">Gemma 3-27B (Google)</option>
+                <option value="local">Local Model (Llama/Gemma)</option> 
             </select><br>
             <label>System prompt (optional)</label><br>
             <input id="system" style="width:100%" placeholder="System prompt"><br><br>
@@ -310,18 +312,26 @@ def index():
 
 @app.post('/ask')
 async def ask(request: Request, req: AskRequest):
-    provider = req.provider or 'gemini-3-flash-preview'
+    # Preserve the original provider label for display, but map gemma-* names to local logic
+    original_provider = req.provider or 'gemini-2.5-flash-lite'
+    provider = original_provider
     llm = getattr(app.state, 'llm', None)
     gemini_default = getattr(app.state, 'gemini_model', None)
 
+    # Map gemma-* providers to local runtime behavior
+    if provider.startswith('gemma-'):
+        provider_logic = 'local'
+    else:
+        provider_logic = provider
+
     # Determine which model to use
-    is_gemini = provider.startswith('gemini')
+    is_gemini = provider_logic.startswith('gemini')
 
     # Validation
-    if provider == 'local' and not llm:
+    if provider_logic == 'local' and not llm:
         if gemini_default:
             logging.info('Local LLM not available, falling back to Gemini')
-            provider = 'gemini-3-flash-preview'
+            provider = 'gemini-2.5-flash-lite'
             is_gemini = True
         else:
             raise HTTPException(status_code=500, detail='Local LLM not loaded and no Gemini fallback available')
@@ -366,10 +376,12 @@ async def ask(request: Request, req: AskRequest):
     # --- GEMINI HANDLER ---
     if is_gemini:
         # Map provider string to actual model name
-        if provider == 'gemini-2.5-flash':
-            model_name = 'gemini-2.5-flash'
+        # If provider begins with 'gemini', use it directly to support variants like 'gemini-2.5-flash-lite'
+        if provider.startswith('gemini'):
+            model_name = provider
         else:
-            model_name = 'gemini-3-flash-preview'
+            # Fall back to server configuration or the GEMINI_MODEL_NAME env var
+            model_name = getattr(app.state, 'gemini_model_name', None) or GEMINI_MODEL_NAME
 
         # Convert history for Gemini
         gemini_history = []
@@ -427,7 +439,7 @@ async def ask(request: Request, req: AskRequest):
             raise HTTPException(status_code=500, detail=str(e))
 
     # --- LOCAL HANDLER ---
-    if provider == 'local':
+    if provider_logic == 'local':
         gen = {
             'temperature': float(os.environ.get('LLM_TEMPERATURE', '0.2')),
             'top_k': int(os.environ.get('LLM_TOP_K', '40')),
@@ -476,7 +488,7 @@ async def ask(request: Request, req: AskRequest):
                     response = llm.create_chat_completion(messages=messages, **gen)
             content = response['choices'][0]['message'].get('content') if response and 'choices' in response else ''
             text = content.strip() if content else ''
-            return {'response': text, 'provider': 'local'}
+            return {'response': text, 'provider': provider}
         except Exception as e:
             logging.exception('LLM generation error: %s', e)
             raise HTTPException(status_code=500, detail=str(e))
