@@ -78,24 +78,42 @@ def format_sse(data: str) -> str:
 
 @app.on_event('startup')
 def startup_event():
-    # Initialize local llama-cpp if possible
+    # Initialize local llama-cpp if possible. Use a pool of instances to allow concurrent requests.
     if Llama is None:
         logging.warning('llama_cpp not available; local generation will not be possible.')
         app.state.llm = None
+        app.state.llm_model_path = None
     else:
         model_path = os.environ.get('MODEL_PATH', DEFAULT_MODEL)
         if not Path(model_path).exists():
             logging.error('Model path not found: %s', model_path)
             app.state.llm = None
+            app.state.llm_model_path = None
         else:
-            try:
-                app.state.llm = Llama(model_path=model_path,
-                                       n_ctx=int(os.environ.get('LLM_N_CTX', '8192')),
-                                       n_threads=int(os.environ.get('LLM_N_THREADS', '4')),
-                                       verbose=False)
-                logging.info('Model loaded from %s', model_path)
-            except Exception as e:
-                logging.exception('Failed to load local model: %s', e)
+            # Store model path and initialize a simple pool manager
+            app.state.llm_model_path = model_path
+            # Pool configuration
+            app.state.llm_pool = asyncio.Queue()
+            app.state.llm_pool_max = int(os.environ.get('LLM_POOL_MAX', '2'))
+            app.state.llm_pool_count = 0
+            preload = int(os.environ.get('LLM_POOL_PRELOAD', '1'))
+            # Optionally preload a single instance (default: yes)
+            if preload and app.state.llm_pool_max > 0:
+                try:
+                    inst = Llama(model_path=model_path,
+                                 n_ctx=int(os.environ.get('LLM_N_CTX', '8192')),
+                                 n_threads=int(os.environ.get('LLM_N_THREADS', '4')),
+                                 verbose=False)
+                    app.state.llm_pool.put_nowait(inst)
+                    app.state.llm_pool_count = 1
+                    # Keep this instance in app.state.llm for backwards compatibility
+                    app.state.llm = inst
+                    logging.info('Preloaded 1 Llama model from %s (pool max=%s)', model_path, app.state.llm_pool_max)
+                except Exception as e:
+                    logging.exception('Failed to preload Llama model: %s', e)
+                    app.state.llm_model_path = None
+                    app.state.llm = None
+            else:
                 app.state.llm = None
 
     # Initialize Gemini if API key is available
@@ -128,6 +146,49 @@ def startup_event():
     try:
         PID_FILE.write_text(str(os.getpid()))
     except Exception:
+        pass
+
+
+# --- LLM pool helpers ---
+async def acquire_llm_instance():
+    """Acquire a Llama instance from the pool or create one (async)."""
+    if getattr(app.state, 'llm_model_path', None) is None:
+        raise RuntimeError('No local model configured')
+    pool = getattr(app.state, 'llm_pool', None)
+    if pool is None:
+        # No pool configured, create a temporary instance
+        inst = await asyncio.to_thread(Llama, model_path=app.state.llm_model_path,
+                                       n_ctx=int(os.environ.get('LLM_N_CTX', '8192')),
+                                       n_threads=int(os.environ.get('LLM_N_THREADS', '4')),
+                                       verbose=False)
+        return inst
+    try:
+        inst = pool.get_nowait()
+        return inst
+    except asyncio.QueueEmpty:
+        # create new instance if pool has capacity
+        if getattr(app.state, 'llm_pool_count', 0) < getattr(app.state, 'llm_pool_max', 1):
+            inst = await asyncio.to_thread(Llama, model_path=app.state.llm_model_path,
+                                           n_ctx=int(os.environ.get('LLM_N_CTX', '8192')),
+                                           n_threads=int(os.environ.get('LLM_N_THREADS', '4')),
+                                           verbose=False)
+            app.state.llm_pool_count = getattr(app.state, 'llm_pool_count', 0) + 1
+            return inst
+        # otherwise wait for one to be released
+        inst = await pool.get()
+        return inst
+
+
+def release_llm_instance(inst):
+    """Return instance to pool or drop it if pool not configured."""
+    pool = getattr(app.state, 'llm_pool', None)
+    if pool is None:
+        # let GC handle it
+        return
+    try:
+        pool.put_nowait(inst)
+    except Exception:
+        # If queue full or closed, drop
         pass
 
 
@@ -333,8 +394,11 @@ async def ask(request: Request, req: AskRequest):
     # - Accept shorthand 'gemini' and map to configured Gemini model name
     # - Treat 'gemma-*' and 'local' as local model requests
     req_prov = (req.provider or '').strip()
-    llm = getattr(app.state, 'llm', None)
     gemini_default = getattr(app.state, 'gemini_model', None)
+    # Whether a local model *could* be used (path configured and llama_cpp present)
+    llm_available = (getattr(app.state, 'llm_model_path', None) is not None) and (Llama is not None)
+    # Backwards compat: provide a convenience reference to any preloaded instance
+    llm = getattr(app.state, 'llm', None) if getattr(app.state, 'llm', None) else None
 
     if not req_prov:
         # Auto-select default: prefer local model when available
@@ -360,7 +424,7 @@ async def ask(request: Request, req: AskRequest):
     is_gemini = isinstance(provider_logic, str) and provider_logic.startswith('gemini')
 
     # Validation
-    if provider_logic == 'local' and not llm:
+    if provider_logic == 'local' and not llm_available:
         if gemini_default:
             logging.info('Local LLM not available, falling back to Gemini')
             provider = 'gemini-2.5-flash-lite'
@@ -490,38 +554,53 @@ async def ask(request: Request, req: AskRequest):
         if stream_requested:
             async def event_stream():
                 yield f"event: provider\ndata: local\n\n"
-                lock = getattr(app.state, 'llm_lock', None)
-                if lock is None:
-                    lock = asyncio.Lock()
-                async with lock:
+                # Acquire a model instance for the duration of the stream
+                try:
+                    llm_inst = await acquire_llm_instance()
+                except Exception as e:
+                    logging.exception('Failed to acquire LLM instance for streaming: %s', e)
+                    yield f"event: error\ndata: {str(e)}\n\n"
+                    return
+                try:
+                    for chunk in llm_inst.create_chat_completion(messages=messages, stream=True, **gen):
+                        try:
+                            choice = (chunk.get('choices') or [{}])[0]
+                            delta = choice.get('delta') or choice.get('message') or {}
+                            text_part = ''
+                            if isinstance(delta, dict):
+                                text_part = delta.get('content') or ''
+                            else:
+                                text_part = str(delta)
+                            if text_part:
+                                yield format_sse(text_part)
+                                await asyncio.sleep(0)
+                        except Exception:
+                            continue
+                    yield 'event: done\ndata: [DONE]\n\n'
+                except Exception as e:
+                    logging.exception('LLM generation error (stream): %s', e)
+                    yield f"event: error\ndata: {str(e)}\n\n"
+                finally:
                     try:
-                        for chunk in llm.create_chat_completion(messages=messages, stream=True, **gen):
-                            try:
-                                choice = (chunk.get('choices') or [{}])[0]
-                                delta = choice.get('delta') or choice.get('message') or {}
-                                text_part = ''
-                                if isinstance(delta, dict):
-                                    text_part = delta.get('content') or ''
-                                else:
-                                    text_part = str(delta)
-                                if text_part:
-                                    yield format_sse(text_part)
-                                    await asyncio.sleep(0)
-                            except Exception:
-                                continue
-                        yield 'event: done\ndata: [DONE]\n\n'
-                    except Exception as e:
-                        logging.exception('LLM generation error (stream): %s', e)
-                        yield f"event: error\ndata: {str(e)}\n\n"
+                        release_llm_instance(llm_inst)
+                    except Exception:
+                        pass
             return StreamingResponse(event_stream(), media_type='text/event-stream')
 
         try:
-            lock = getattr(app.state, 'llm_lock', None)
-            if lock is None:
-                response = llm.create_chat_completion(messages=messages, **gen)
-            else:
-                async with lock:
-                    response = llm.create_chat_completion(messages=messages, **gen)
+            # Acquire instance and run blocking creation in a threadpool to avoid blocking the event loop
+            try:
+                llm_inst = await acquire_llm_instance()
+            except Exception as e:
+                logging.exception('Failed to acquire LLM instance: %s', e)
+                raise HTTPException(status_code=500, detail=str(e))
+            try:
+                response = await asyncio.to_thread(llm_inst.create_chat_completion, messages=messages, **gen)
+            finally:
+                try:
+                    release_llm_instance(llm_inst)
+                except Exception:
+                    pass
             content = response['choices'][0]['message'].get('content') if response and 'choices' in response else ''
             text = content.strip() if content else ''
             return {'response': text, 'provider': provider}
@@ -551,9 +630,14 @@ def shutdown(request: Request):
 
 @app.get('/llm_status')
 def llm_status():
-    llm = getattr(app.state, 'llm', None)
     gemini = getattr(app.state, 'gemini_model', None)
-    if llm:
+    llm_path = getattr(app.state, 'llm_model_path', None)
+    pool_max = getattr(app.state, 'llm_pool_max', 0)
+    pool_count = getattr(app.state, 'llm_pool_count', 0)
+    pool_q = getattr(app.state, 'llm_pool', None)
+    pool_idle = pool_q.qsize() if pool_q is not None else (1 if getattr(app.state, 'llm', None) else 0)
+
+    if llm_path:
         provider = 'local'
         ok = True
     elif gemini:
@@ -562,8 +646,9 @@ def llm_status():
     else:
         provider = ''
         ok = False
+
     url = os.environ.get('LLM_SERVER_URL', 'http://ashy.tplinkdns.com:5005/ask')
-    return {'ok': ok, 'status': 'Connected' if ok else 'Not connected', 'provider': provider, 'url': url}
+    return {'ok': ok, 'status': 'Connected' if ok else 'Not connected', 'provider': provider, 'url': url, 'pool_max': pool_max, 'pool_count': pool_count, 'pool_idle': pool_idle}
 
 
 if __name__ == '__main__':
