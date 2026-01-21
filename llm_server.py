@@ -308,6 +308,21 @@ def index():
     </body>
     </html>
     """
+    # Compute LLM status for display
+    llm = getattr(app.state, 'llm', None)
+    gemini = getattr(app.state, 'gemini_model', None)
+    if llm:
+        provider = 'local'
+    elif gemini:
+        provider = getattr(app.state, 'gemini_model_name', GEMINI_MODEL_NAME)
+    else:
+        provider = ''
+    llm_url = os.environ.get('LLM_SERVER_URL', 'http://ashy.tplinkdns.com:5005/ask')
+    if provider:
+        status_html = f'<div style="margin-bottom:8px;"><strong>LLM:</strong> Connected [{provider}] (<a href="{llm_url}" target="_blank">{llm_url}</a>)</div>'
+    else:
+        status_html = '<div style="margin-bottom:8px; color:#b00"><strong>LLM:</strong> Not connected</div>'
+    html = html.replace('<h2>LLM Server</h2>', f'<h2>LLM Server</h2>\n        {status_html}')
     return HTMLResponse(content=html)
 
 
@@ -532,6 +547,23 @@ def shutdown(request: Request):
 
     threading.Timer(0.2, _exit).start()
     return {'status': 'shutting_down'}
+
+
+@app.get('/llm_status')
+def llm_status():
+    llm = getattr(app.state, 'llm', None)
+    gemini = getattr(app.state, 'gemini_model', None)
+    if llm:
+        provider = 'local'
+        ok = True
+    elif gemini:
+        provider = getattr(app.state, 'gemini_model_name', GEMINI_MODEL_NAME)
+        ok = True
+    else:
+        provider = ''
+        ok = False
+    url = os.environ.get('LLM_SERVER_URL', 'http://ashy.tplinkdns.com:5005/ask')
+    return {'ok': ok, 'status': 'Connected' if ok else 'Not connected', 'provider': provider, 'url': url}
 
 
 if __name__ == '__main__':
