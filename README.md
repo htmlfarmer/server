@@ -1,2 +1,2 @@
 # server
-LLM AI SERVER
+LLM / AI Server
