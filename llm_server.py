@@ -60,7 +60,8 @@ class AskRequest(BaseModel):
     system_prompt: Optional[str] = None
     generation_params: Optional[Dict[str, Any]] = None
     conversation: Optional[List[Dict[str, str]]] = None
-    provider: Optional[str] = 'gemini-2.5-flash-lite' # 'local', 'gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemma-3-27b'
+    # If provider is omitted or empty, server will choose a sensible default (local if loaded, else configured Gemini model)
+    provider: Optional[str] = None # 'local', 'gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemma-3-27b'
 
 class AskResponse(BaseModel):
     response: str
@@ -312,20 +313,36 @@ def index():
 
 @app.post('/ask')
 async def ask(request: Request, req: AskRequest):
-    # Preserve the original provider label for display, but map gemma-* names to local logic
-    original_provider = req.provider or 'gemini-2.5-flash-lite'
-    provider = original_provider
+    # Normalize provider selection:
+    # - If client omits provider or sends '', choose local if loaded, else configured Gemini model
+    # - Accept shorthand 'gemini' and map to configured Gemini model name
+    # - Treat 'gemma-*' and 'local' as local model requests
+    req_prov = (req.provider or '').strip()
     llm = getattr(app.state, 'llm', None)
     gemini_default = getattr(app.state, 'gemini_model', None)
 
-    # Map gemma-* providers to local runtime behavior
-    if provider.startswith('gemma-'):
+    if not req_prov:
+        # Auto-select default: prefer local model when available
+        if llm:
+            provider = 'local'
+        elif gemini_default:
+            provider = getattr(app.state, 'gemini_model_name', GEMINI_MODEL_NAME)
+        else:
+            # No LLM available at all
+            raise HTTPException(status_code=500, detail='No LLM available: no local model loaded and no Gemini configured')
+    else:
+        provider = req_prov
+
+    original_provider = provider
+
+    # Map gemma-* and explicit 'local' to local logic
+    if provider.startswith('gemma-') or provider == 'local':
         provider_logic = 'local'
     else:
         provider_logic = provider
 
-    # Determine which model to use
-    is_gemini = provider_logic.startswith('gemini')
+    # Determine whether we're targeting Gemini (provider starts with 'gemini')
+    is_gemini = isinstance(provider_logic, str) and provider_logic.startswith('gemini')
 
     # Validation
     if provider_logic == 'local' and not llm:
@@ -377,8 +394,12 @@ async def ask(request: Request, req: AskRequest):
     if is_gemini:
         # Map provider string to actual model name
         # If provider begins with 'gemini', use it directly to support variants like 'gemini-2.5-flash-lite'
+        # Map 'gemini' shorthand to configured Gemini model name; allow full model names like 'gemini-2.5-flash-lite'
         if provider.startswith('gemini'):
-            model_name = provider
+            if provider == 'gemini':
+                model_name = getattr(app.state, 'gemini_model_name', None) or GEMINI_MODEL_NAME
+            else:
+                model_name = provider
         else:
             # Fall back to server configuration or the GEMINI_MODEL_NAME env var
             model_name = getattr(app.state, 'gemini_model_name', None) or GEMINI_MODEL_NAME
