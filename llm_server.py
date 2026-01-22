@@ -401,14 +401,8 @@ async def ask(request: Request, req: AskRequest):
     llm = getattr(app.state, 'llm', None) if getattr(app.state, 'llm', None) else None
 
     if not req_prov:
-        # Auto-select default: prefer local model when available
-        if llm:
-            provider = 'local'
-        elif gemini_default:
-            provider = getattr(app.state, 'gemini_model_name', GEMINI_MODEL_NAME)
-        else:
-            # No LLM available at all
-            raise HTTPException(status_code=500, detail='No LLM available: no local model loaded and no Gemini configured')
+        # Auto-select default: default to configured Gemini model name (gemini-2.5-flash-lite)
+        provider = getattr(app.state, 'gemini_model_name', None) or GEMINI_MODEL_NAME
     else:
         provider = req_prov
 
