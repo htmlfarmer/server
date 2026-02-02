@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 import asyncio
 import re
+import time
+import json
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -206,9 +208,36 @@ def index():
     html = """
     <!doctype html>
     <html>
-    <head><meta charset="utf-8"><title>LLM Server</title></head>
+        <head>
+        <meta charset="utf-8"><title>LLM Server</title>
+        <style>
+            .dot {
+                height: 12px;
+                width: 12px;
+                border-radius: 50%;
+                display: inline-block;
+                margin-right: 8px;
+            }
+            .dot-green {
+                background-color: #28a745;
+                animation: blink-green 1s infinite;
+            }
+            .dot-red {
+                background-color: #dc3545;
+            }
+            @keyframes blink-green {
+                0% { opacity: 1; }
+                50% { opacity: 0.5; }
+                100% { opacity: 1; }
+            }
+        </style>
+    </head>
     <body style="font-family: Arial, Helvetica, sans-serif; margin:20px;">
         <h2>LLM Server</h2>
+            <div id="status-container" style="margin-bottom:8px; display: flex; align-items: center;">
+                <span id="status-dot" class="dot"></span>
+                <span id="status-text"></span>
+            </div>
         <form id="frm">
             <label>Provider</label><br>
             <select id="provider" style="width:100%; margin-bottom:10px; padding:4px;">
@@ -226,6 +255,7 @@ def index():
         </form>
         <h3>Response (<span id="active-provider">None</span>)</h3>
         <pre id="resp" style="white-space:pre-wrap; background:#f6f6f6; padding:12px; border-radius:6px; max-width:800px;"></pre>
+        <div id="stats" style="margin-top:8px; color:#555; font-size:0.9em;"></div>
 
         <hr>
         <h3>Conversation</h3>
@@ -269,6 +299,8 @@ def index():
                 renderConversation();
             });
 
+            document.getElementById('provider').addEventListener('change', updateStatus);
+
             document.getElementById('frm').addEventListener('submit', async function(e) {
                 e.preventDefault();
                 const promptEl = document.getElementById('prompt');
@@ -286,8 +318,10 @@ def index():
 
                 const respEl = document.getElementById('resp');
                 const providerEl = document.getElementById('active-provider');
+                const statsEl = document.getElementById('stats');
                 respEl.textContent = '';
                 providerEl.textContent = '...';
+                statsEl.textContent = '';
 
                 // Optimistically update UI
                 conversation.push({ role: 'user', content: prompt });
@@ -313,6 +347,11 @@ def index():
                         const j = await r.json();
                         respEl.textContent = j.response || '';
                         providerEl.textContent = j.provider || 'unknown';
+                        if (j.tokens) {
+                            statsEl.textContent = `Tokens: ${j.tokens}, ${(j.tok_per_sec||0).toFixed(1)} tok/s, Time: ${(j.seconds||0).toFixed(2)}s`;
+                        } else {
+                            statsEl.textContent = '';
+                        }
                         conversation.push({ role: 'assistant', content: j.response || '' });
                         renderConversation();
                         return;
@@ -332,6 +371,14 @@ def index():
                         for (const part of parts) {
                             if (part.startsWith('event: provider')) {
                                 providerEl.textContent = part.split('data: ')[1] || 'unknown';
+                                continue;
+                            }
+                            if (part.startsWith('event: stats')) {
+                                const data = part.split('data: ')[1] || '';
+                                try {
+                                    const s = JSON.parse(data);
+                                    statsEl.textContent = `Tokens: ${s.tokens}, ${s.tok_per_sec.toFixed(1)} tok/s, Time: ${s.seconds.toFixed(2)}s`;
+                                } catch(e) {}
                                 continue;
                             }
                             const lines = part.split('\\n');
@@ -361,10 +408,27 @@ def index():
                     }
                 } catch (err) {
                     respEl.textContent = 'Request failed: ' + String(err);
+                    statsEl.textContent = '';
                     conversation.pop(); // remove optimistic user message
                     renderConversation();
                 }
             });
+            function updateStatus() {
+                const providerSelect = document.getElementById('provider');
+                const selectedProvider = providerSelect.options[providerSelect.selectedIndex].text;
+                const statusDot = document.getElementById('status-dot');
+                const statusText = document.getElementById('status-text');
+
+                if (providerSelect.value) {
+                    statusDot.className = 'dot dot-green';
+                    statusText.innerHTML = `Connected: <strong>${selectedProvider}</strong>`;
+                } else {
+                    statusDot.className = 'dot dot-red';
+                    statusText.innerHTML = 'Not connected';
+                }
+            }
+
+            window.addEventListener('load', updateStatus);
         </script>
     </body>
     </html>
@@ -380,9 +444,17 @@ def index():
         provider = ''
     llm_url = os.environ.get('LLM_SERVER_URL', 'http://ashy.tplinkdns.com:5005/ask')
     if provider:
-        status_html = f'<div style="margin-bottom:8px;"><strong>LLM:</strong> Connected [{provider}] (<a href="{llm_url}" target="_blank">{llm_url}</a>)</div>'
+        status_html = f'''
+        <div style="margin-bottom:8px; display: flex; align-items: center;">
+            <span class="dot dot-green"></span>
+            <span>Connected: <strong>{provider}</strong></span>
+        </div>'''
     else:
-        status_html = '<div style="margin-bottom:8px; color:#b00"><strong>LLM:</strong> Not connected</div>'
+        status_html = f'''
+        <div style="margin-bottom:8px; color:#b00; display: flex; align-items: center;">
+            <span class="dot dot-red"></span>
+            <span>Not connected</span>
+        </div>'''
     html = html.replace('<h2>LLM Server</h2>', f'<h2>LLM Server</h2>\n        {status_html}')
     return HTMLResponse(content=html)
 
@@ -428,11 +500,11 @@ async def ask(request: Request, req: AskRequest):
     
     if is_gemini and not gemini_default:
         if llm:
-             logging.warning('Gemini not available, falling back to local')
-             provider = 'local'
-             is_gemini = False
+            logging.warning('Gemini not available, falling back to local')
+            provider = 'local'
+            is_gemini = False
         else:
-             raise HTTPException(status_code=500, detail='Gemini API not initialized (no key) and no local LLM available')
+            raise HTTPException(status_code=500, detail='Gemini API not initialized (no key) and no local LLM available')
 
     client_ip = (request.headers.get('X-Forwarded-For') or (request.client.host if request.client else 'unknown')).split(',')[0].strip()
     logging.info('Received /ask (%s) from %s', provider, client_ip)
@@ -502,14 +574,21 @@ async def ask(request: Request, req: AskRequest):
             async def gemini_stream():
                 try:
                     yield f"event: provider\ndata: {provider}\n\n"
+                    start = time.time()
+                    final_text = ''
                     response = await asyncio.to_thread(chat.send_message, user_msg['parts'][0], stream=True)
                     for chunk in response:
                         try:
                             if chunk.text:
+                                final_text += chunk.text
                                 yield format_sse(chunk.text)
                         except (ValueError, IndexError, AttributeError):
                             pass
                         await asyncio.sleep(0)
+                    elapsed = time.time() - start
+                    tokens_est = max(1, int(len(final_text) / 4))
+                    tok_per_sec = (tokens_est / elapsed) if elapsed > 0 else tokens_est
+                    yield f"event: stats\ndata: {json.dumps({'tokens': tokens_est, 'seconds': elapsed, 'tok_per_sec': tok_per_sec})}\n\n"
                     yield 'event: done\ndata: [DONE]\n\n'
                 except Exception as e:
                     logging.exception('Gemini streaming error: %s', e)
@@ -517,7 +596,9 @@ async def ask(request: Request, req: AskRequest):
             return StreamingResponse(gemini_stream(), media_type='text/event-stream')
         
         try:
+            start = time.time()
             response = await asyncio.to_thread(chat.send_message, user_msg['parts'][0])
+            elapsed = time.time() - start
             try:
                 text = response.text
             except (ValueError, IndexError, AttributeError) as ve:
@@ -527,7 +608,9 @@ async def ask(request: Request, req: AskRequest):
                         reason = str(response.candidates[0].finish_reason)
                 except: pass
                 text = f"[Gemini Blocked/Empty] Finish reason: {reason}. Detail: {str(ve)}"
-            return {'response': text, 'provider': provider}
+            tokens_est = max(1, int(len(text) / 4))
+            tok_per_sec = (tokens_est / elapsed) if elapsed > 0 else tokens_est
+            return {'response': text, 'provider': provider, 'tokens': tokens_est, 'seconds': elapsed, 'tok_per_sec': tok_per_sec}
         except Exception as e:
             logging.exception('Gemini error: %s', e)
             raise HTTPException(status_code=500, detail=str(e))
@@ -556,6 +639,8 @@ async def ask(request: Request, req: AskRequest):
                     yield f"event: error\ndata: {str(e)}\n\n"
                     return
                 try:
+                    start = time.time()
+                    final_text = ''
                     for chunk in llm_inst.create_chat_completion(messages=messages, stream=True, **gen):
                         try:
                             choice = (chunk.get('choices') or [{}])[0]
@@ -566,10 +651,15 @@ async def ask(request: Request, req: AskRequest):
                             else:
                                 text_part = str(delta)
                             if text_part:
+                                final_text += text_part
                                 yield format_sse(text_part)
                                 await asyncio.sleep(0)
                         except Exception:
                             continue
+                    elapsed = time.time() - start
+                    tokens_est = max(1, int(len(final_text) / 4))
+                    tok_per_sec = (tokens_est / elapsed) if elapsed > 0 else tokens_est
+                    yield f"event: stats\ndata: {json.dumps({'tokens': tokens_est, 'seconds': elapsed, 'tok_per_sec': tok_per_sec})}\n\n"
                     yield 'event: done\ndata: [DONE]\n\n'
                 except Exception as e:
                     logging.exception('LLM generation error (stream): %s', e)
@@ -589,7 +679,9 @@ async def ask(request: Request, req: AskRequest):
                 logging.exception('Failed to acquire LLM instance: %s', e)
                 raise HTTPException(status_code=500, detail=str(e))
             try:
+                start = time.time()
                 response = await asyncio.to_thread(llm_inst.create_chat_completion, messages=messages, **gen)
+                elapsed = time.time() - start
             finally:
                 try:
                     release_llm_instance(llm_inst)
@@ -597,7 +689,9 @@ async def ask(request: Request, req: AskRequest):
                     pass
             content = response['choices'][0]['message'].get('content') if response and 'choices' in response else ''
             text = content.strip() if content else ''
-            return {'response': text, 'provider': provider}
+            tokens_est = max(1, int(len(text) / 4))
+            tok_per_sec = (tokens_est / elapsed) if elapsed > 0 else tokens_est
+            return {'response': text, 'provider': provider, 'tokens': tokens_est, 'seconds': elapsed, 'tok_per_sec': tok_per_sec}
         except Exception as e:
             logging.exception('LLM generation error: %s', e)
             raise HTTPException(status_code=500, detail=str(e))
@@ -650,7 +744,6 @@ if __name__ == '__main__':
     import subprocess
     import signal
     import sys
-    import time
 
     def start_foreground():
         import uvicorn
