@@ -16,6 +16,8 @@ import re
 import time
 import json
 
+from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,10 +29,165 @@ try:
 except Exception:
     Llama = None
 
+# GPU detection and safe Llama factory
+import inspect
+import subprocess
+
+def _detect_cuda_hardware() -> bool:
+    # Check torch if available
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return True
+    except Exception:
+        pass
+    # Check nvidia-smi
+    try:
+        p = subprocess.run(['nvidia-smi', '-L'], capture_output=True, text=True, timeout=2)
+        if p.returncode == 0 and p.stdout.strip():
+            return True
+    except Exception:
+        pass
+    # Check device file or env
+    if os.path.exists('/dev/nvidia0'):
+        return True
+    cvd = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+    if cvd and cvd != '-1':
+        return True
+    return False
+
+def detect_cuda_available() -> bool:
+    # Allow forcing via env var LLM_USE_CUDA: '1'/'true' to enable or '0'/'false' to disable
+    env = os.environ.get('LLM_USE_CUDA', '').strip().lower()
+    if env in ('0', 'false', 'no'):
+        return False
+    if env in ('1', 'true', 'yes'):
+        return _detect_cuda_hardware()
+    # Auto-detect
+    return _detect_cuda_hardware()
+
+def _smi_memory_used():
+    """Return list of memory.used values (MB) for each GPU, or None if not available."""
+    try:
+        p = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=3)
+        if p.returncode == 0 and p.stdout.strip():
+            return [int(x.strip()) for x in p.stdout.strip().splitlines()]
+    except Exception:
+        pass
+    return None
+
+
+def create_llama_instance(model_path: str, verify_gpu: bool = False):
+    """Create a Llama instance, attempting to use GPU if available and supported, falling back to CPU.
+
+    Tries multiple possible GPU parameter names (`gpu_layers`, `n_gpu_layers`) to support different
+    versions of `llama-cpp-python`/bindings. The number of GPU layers can be set via
+    `LLM_GPU_LAYERS` or `LLM_N_GPU_LAYERS` (fallback to 8).
+
+    If verify_gpu=True and a GPU instantiation succeeds, we perform a small generation and check
+    `nvidia-smi` memory before/after to ensure the instance actually used the GPU. If verification
+    fails we fall back to CPU.
+    """
+    base_kwargs = dict(model_path=model_path,
+                       n_ctx=int(os.environ.get('LLM_N_CTX', '8192')),
+                       n_threads=int(os.environ.get('LLM_N_THREADS', '4')),
+                       verbose=False)
+    # Try GPU if flagged on app.state (set during startup)
+    use_gpu = getattr(app.state, 'llm_use_gpu', False)
+    # If we've explicitly verified that GPU does NOT work, avoid attempting GPU unless verify_gpu=True
+    if use_gpu and (getattr(app.state, 'llm_gpu_verified', None) is False) and not verify_gpu:
+        use_gpu = False
+    if use_gpu:
+        # Determine desired gpu_layers from env or default
+        try:
+            gpu_layers = int(os.environ.get('LLM_GPU_LAYERS', os.environ.get('LLM_N_GPU_LAYERS', '8')))
+        except Exception:
+            gpu_layers = 8
+
+        tried = []
+        # Try parameter names in order of preference
+        for param_name in ('gpu_layers', 'n_gpu_layers'):
+            gpu_kwargs = base_kwargs.copy()
+            gpu_kwargs[param_name] = gpu_layers
+            tried.append(param_name)
+            try:
+                inst = Llama(**gpu_kwargs)
+
+                # If requested, verify that the instance actually uses the GPU by measuring
+                # nvidia-smi memory before/after a very small generation.
+                verified = False
+                if verify_gpu:
+                    sm_before = _smi_memory_used()
+                    try:
+                        # perform a tiny generation (1 token) to trigger GPU allocation
+                        _ = inst.create_chat_completion(messages=[{'role':'user', 'content': 'probe'}], max_tokens=1, temperature=0.0)
+                    except Exception:
+                        # generation may fail in some models; ignore and rely on smi check
+                        pass
+                    time.sleep(0.15)
+                    sm_after = _smi_memory_used()
+                    if sm_before is not None and sm_after is not None:
+                        # consider GPU used if any GPU memory increased by >= 10 MB
+                        deltas = [a - b for a, b in zip(sm_after, sm_before)]
+                        if any(d >= 10 for d in deltas):
+                            verified = True
+                    else:
+                        # Could not read nvidia-smi; fall back to attribute inspection
+                        for name in dir(inst):
+                            if any(k in name.lower() for k in ('gpu', 'cuda', 'device')):
+                                verified = True
+                                break
+
+                if verify_gpu and not verified:
+                    # Close and drop this instance and try next option or CPU fallback
+                    try:
+                        if hasattr(inst, 'close'):
+                            inst.close()
+                    except Exception:
+                        pass
+                    logging.warning('GPU instantiation for %s=%s did not exhibit GPU usage; falling back', param_name, gpu_layers)
+                    continue
+
+                # Record the successful GPU config on app.state for UI/status visibility
+                try:
+                    app.state.llm_last_gpu_param = param_name
+                    app.state.llm_last_gpu_layers = gpu_layers
+                    app.state.llm_has_gpu = True
+                    app.state.llm_gpu_verified = verified
+                except Exception:
+                    pass
+                logging.info('Instantiated Llama with GPU param %s=%s (verified=%s)', param_name, gpu_layers, bool(verified))
+                return inst
+            except TypeError:
+                # Parameter not accepted by this Llama build; try next
+                continue
+            except Exception as e:
+                # Instantiation failed with this param; log and try next
+                logging.warning('Llama init with %s=%s failed: %s', param_name, gpu_layers, str(e))
+                continue
+        # Mark that we attempted GPU params but none succeeded
+        try:
+            app.state.llm_last_gpu_param = None
+            app.state.llm_last_gpu_layers = None
+            app.state.llm_has_gpu = False
+            app.state.llm_gpu_verified = False
+        except Exception:
+            pass
+        logging.warning('Tried GPU params %s but could not instantiate GPU-enabled Llama. Falling back to CPU.', tried)
+    # Fallback to CPU-only instantiation
+    try:
+        app.state.llm_last_gpu_param = None
+        app.state.llm_last_gpu_layers = None
+        app.state.llm_has_gpu = False
+        app.state.llm_gpu_verified = False
+    except Exception:
+        pass
+    return Llama(**base_kwargs)
+
 try:
-    import google.generativeai as genai
+    import google as genai
 except Exception as e:
-    logging.error(f"Failed to import google.generativeai: {e}")
+    logging.error(f"Failed to import google genai: {e}")
     genai = None
 
 APP_DIR = Path(__file__).resolve().parent
@@ -47,39 +204,9 @@ PORT = int(os.environ.get('LLM_PORT', '5005'))
 GEMINI_MODEL_NAME = os.environ.get('GEMINI_MODEL_NAME', 'gemini-2.5-flash-lite')
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class AskRequest(BaseModel):
-    prompt: str
-    system_prompt: Optional[str] = None
-    generation_params: Optional[Dict[str, Any]] = None
-    conversation: Optional[List[Dict[str, str]]] = None
-    # If provider is omitted or empty, server will choose a sensible default (local if loaded, else configured Gemini model)
-    provider: Optional[str] = None # 'local', 'gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemma-3-27b'
-
-class AskResponse(BaseModel):
-    response: str
-    provider: str
-
-
-def format_sse(data: str) -> str:
-    if data is None:
-        return 'data: \n\n'
-    parts = data.split('\n')
-    out_lines = [f"data: {p}" for p in parts]
-    return '\n'.join(out_lines) + '\n\n'
-
-
-@app.on_event('startup')
-def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     # Initialize local llama-cpp if possible. Use a pool of instances to allow concurrent requests.
     if Llama is None:
         logging.warning('llama_cpp not available; local generation will not be possible.')
@@ -94,6 +221,9 @@ def startup_event():
         else:
             # Store model path and initialize a simple pool manager
             app.state.llm_model_path = model_path
+            # Detect CUDA GPU availability for llama-cpp usage
+            app.state.llm_use_gpu = detect_cuda_available()
+            logging.info('CUDA available for local LLM: %s (LLM_USE_CUDA env overrides detection)', app.state.llm_use_gpu)
             # Pool configuration
             app.state.llm_pool = asyncio.Queue()
             app.state.llm_pool_max = int(os.environ.get('LLM_POOL_MAX', '2'))
@@ -102,15 +232,12 @@ def startup_event():
             # Optionally preload a single instance (default: yes)
             if preload and app.state.llm_pool_max > 0:
                 try:
-                    inst = Llama(model_path=model_path,
-                                 n_ctx=int(os.environ.get('LLM_N_CTX', '8192')),
-                                 n_threads=int(os.environ.get('LLM_N_THREADS', '4')),
-                                 verbose=False)
+                    inst = create_llama_instance(model_path, verify_gpu=True)
                     app.state.llm_pool.put_nowait(inst)
                     app.state.llm_pool_count = 1
                     # Keep this instance in app.state.llm for backwards compatibility
                     app.state.llm = inst
-                    logging.info('Preloaded 1 Llama model from %s (pool max=%s)', model_path, app.state.llm_pool_max)
+                    logging.info('Preloaded 1 Llama model from %s (pool max=%s, gpu=%s, verified=%s)', model_path, app.state.llm_pool_max, app.state.llm_use_gpu, getattr(app.state, 'llm_gpu_verified', False))
                 except Exception as e:
                     logging.exception('Failed to preload Llama model: %s', e)
                     app.state.llm_model_path = None
@@ -149,20 +276,62 @@ def startup_event():
         PID_FILE.write_text(str(os.getpid()))
     except Exception:
         pass
+    yield
+    try:
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+    except Exception:
+        pass
+
+app = FastAPI(lifespan=lifespan)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class AskRequest(BaseModel):
+    prompt: str
+    system_prompt: Optional[str] = None
+    generation_params: Optional[Dict[str, Any]] = None
+    conversation: Optional[List[Dict[str, str]]] = None
+    # If provider is omitted or empty, server will choose a sensible default (local if loaded, else configured Gemini model)
+    provider: Optional[str] = None # 'local', 'gemini-3-flash-preview', 'gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemma-3-27b'
+    # Device preference: 'auto' (default), 'gpu' (GPU only), 'cpu' (CPU only)
+    device_preference: Optional[str] = None
+
+class AskResponse(BaseModel):
+    response: str
+    provider: str
+
+
+def format_sse(data: str) -> str:
+    if data is None:
+        return 'data: \n\n'
+    parts = data.split('\n')
+    out_lines = [f"data: {p}" for p in parts]
+    return '\n'.join(out_lines) + '\n\n'
+
+
+
 
 
 # --- LLM pool helpers ---
-async def acquire_llm_instance():
-    """Acquire a Llama instance from the pool or create one (async)."""
+async def acquire_llm_instance(force_cpu: bool = False):
+    """Acquire a Llama instance from the pool or create one (async).
+
+    If force_cpu=True, will create a CPU-only instance and not use pooled GPU instances.
+    """
     if getattr(app.state, 'llm_model_path', None) is None:
         raise RuntimeError('No local model configured')
     pool = getattr(app.state, 'llm_pool', None)
     if pool is None:
         # No pool configured, create a temporary instance
-        inst = await asyncio.to_thread(Llama, model_path=app.state.llm_model_path,
-                                       n_ctx=int(os.environ.get('LLM_N_CTX', '8192')),
-                                       n_threads=int(os.environ.get('LLM_N_THREADS', '4')),
-                                       verbose=False)
+        inst = await asyncio.to_thread(create_llama_instance, app.state.llm_model_path, verify_gpu=False, force_cpu=force_cpu)
         return inst
     try:
         inst = pool.get_nowait()
@@ -170,10 +339,7 @@ async def acquire_llm_instance():
     except asyncio.QueueEmpty:
         # create new instance if pool has capacity
         if getattr(app.state, 'llm_pool_count', 0) < getattr(app.state, 'llm_pool_max', 1):
-            inst = await asyncio.to_thread(Llama, model_path=app.state.llm_model_path,
-                                           n_ctx=int(os.environ.get('LLM_N_CTX', '8192')),
-                                           n_threads=int(os.environ.get('LLM_N_THREADS', '4')),
-                                           verbose=False)
+            inst = await asyncio.to_thread(create_llama_instance, app.state.llm_model_path, verify_gpu=False, force_cpu=force_cpu)
             app.state.llm_pool_count = getattr(app.state, 'llm_pool_count', 0) + 1
             return inst
         # otherwise wait for one to be released
@@ -194,13 +360,7 @@ def release_llm_instance(inst):
         pass
 
 
-@app.on_event('shutdown')
-def shutdown_event():
-    try:
-        if PID_FILE.exists():
-            PID_FILE.unlink()
-    except Exception:
-        pass
+
 
 
 @app.get('/', response_class=HTMLResponse)
@@ -246,6 +406,12 @@ def index():
                 <option value="gemini-2.5-flash-lite" selected>Google Gemini 2.5 Flash Lite (Unlimited!)</option>
                 <option value="gemma-3-27b">Gemma 3-27B (Google)</option>
                 <option value="local">Local Model (Llama/Gemma)</option> 
+            </select><br>
+            <label>Device</label><br>
+            <select id="device" style="width:100%; margin-bottom:10px; padding:4px;">
+                <option value="auto" selected>Auto</option>
+                <option value="gpu">GPU only</option>
+                <option value="cpu">CPU only</option>
             </select><br>
             <label>System prompt (optional)</label><br>
             <input id="system" style="width:100%" placeholder="System prompt"><br><br>
@@ -307,12 +473,14 @@ def index():
                 const prompt = promptEl.value;
                 const system = document.getElementById('system').value || undefined;
                 const provider = document.getElementById('provider').value;
+                const device = document.getElementById('device').value;
                 if (!prompt || !prompt.trim()) return;
 
                 const payload = {
                     prompt: prompt,
                     system_prompt: system,
                     provider: provider,
+                    device_preference: device,
                     conversation: conversation.slice() // Send history, server adds current prompt
                 };
 
@@ -416,12 +584,14 @@ def index():
             function updateStatus() {
                 const providerSelect = document.getElementById('provider');
                 const selectedProvider = providerSelect.options[providerSelect.selectedIndex].text;
+                const deviceSelect = document.getElementById('device');
+                const selectedDevice = deviceSelect ? deviceSelect.options[deviceSelect.selectedIndex].text : '';
                 const statusDot = document.getElementById('status-dot');
                 const statusText = document.getElementById('status-text');
 
                 if (providerSelect.value) {
                     statusDot.className = 'dot dot-green';
-                    statusText.innerHTML = `Connected: <strong>${selectedProvider}</strong>`;
+                    statusText.innerHTML = `Connected: <strong>${selectedProvider}</strong> ${selectedDevice ? ' — ' + selectedDevice : ''}`;
                 } else {
                     statusDot.className = 'dot dot-red';
                     statusText.innerHTML = 'Not connected';
@@ -443,11 +613,39 @@ def index():
     else:
         provider = ''
     llm_url = os.environ.get('LLM_SERVER_URL', 'http://ashy.tplinkdns.com:5005/ask')
+
+    # Determine GPU display info
+    gpu_enabled = bool(getattr(app.state, 'llm_use_gpu', False))
+    gpu_param = getattr(app.state, 'llm_last_gpu_param', None)
+    gpu_layers = getattr(app.state, 'llm_last_gpu_layers', None)
+
     if provider:
+        if provider == 'local':
+            # Show a concise label: either GPU (if GPU is actually in use) or CPU ONLY
+            if getattr(app.state, 'llm_has_gpu', False):
+                provider_label = 'GPU'
+                # show details in a smaller subtle span, and indicate verification status
+                details = ''
+                try:
+                    p = getattr(app.state, 'llm_last_gpu_param', None)
+                    l = getattr(app.state, 'llm_last_gpu_layers', None)
+                    v = getattr(app.state, 'llm_gpu_verified', False)
+                    if p and l:
+                        details = f' <small>({p}={l}{" verified" if v else ""})</small>'
+                    else:
+                        if v:
+                            details = ' <small>(verified)</small>'
+                except Exception:
+                    details = ''
+                provider_label_html = f'{provider_label}{details}'
+            else:
+                provider_label_html = 'CPU ONLY'
+        else:
+            provider_label_html = provider
         status_html = f'''
         <div style="margin-bottom:8px; display: flex; align-items: center;">
             <span class="dot dot-green"></span>
-            <span>Connected: <strong>{provider}</strong></span>
+            <span>Connected: <strong>{provider_label_html}</strong></span>
         </div>'''
     else:
         status_html = f'''
@@ -455,7 +653,143 @@ def index():
             <span class="dot dot-red"></span>
             <span>Not connected</span>
         </div>'''
-    html = html.replace('<h2>LLM Server</h2>', f'<h2>LLM Server</h2>\n        {status_html}')
+    # Diagnostics display
+    diag = getattr(app.state, 'llm_diag', None)
+    last_diag_text = 'No tests run yet'
+    if diag:
+        try:
+            ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(diag.get('time', time.time())))
+            last_diag_text = f"{'OK' if diag.get('ok') else 'FAIL'} at {ts}: {diag.get('msg','')}. Took {diag.get('seconds',0):.2f}s"
+        except Exception:
+            last_diag_text = str(diag)
+
+    pool_q = getattr(app.state, 'llm_pool', None)
+    pool_idle = pool_q.qsize() if pool_q is not None else (1 if getattr(app.state, 'llm', None) else 0)
+    pool_count = getattr(app.state, 'llm_pool_count', 0)
+
+    # Connection label reflects whether GPU is verified
+    conn_label = 'CPU ONLY'
+    try:
+        if getattr(app.state, 'llm_has_gpu', False):
+            conn_label = 'GPU (verified)' if getattr(app.state, 'llm_gpu_verified', False) else 'GPU (not verified)'
+    except Exception:
+        pass
+
+    diag_html = f'''
+        <div style="margin-top:8px; padding:8px; border-radius:6px; background:#f8f9fa; border:1px solid #ddd; max-width:800px;">
+            <strong>Diagnostics</strong>
+            <div style="margin-top:6px; font-size:0.95em; color:#333;">
+                <div id="diag-connection">Connection: <strong>{conn_label}</strong></div>
+                <div id="diag-gpu">GPU param: <strong>{getattr(app.state,'llm_last_gpu_param',None)}</strong> layers: <strong>{getattr(app.state,'llm_last_gpu_layers',None)}</strong></div>
+                <div id="diag-pool">Pool: {pool_count} total, {pool_idle} idle</div>
+                <div id="diag-last-test">Last test: <span id="diag-last-test-text">{last_diag_text}</span></div>
+                <div style="margin-top:6px;">
+                    <button id="run-diag">Run GPU test</button>
+                    <button id="run-autotune" style="margin-left:8px;">Auto-tune GPU</button>
+                    <button id="run-probe" style="margin-left:8px;">Run GPU probe</button>
+                    <small style="color:#666; margin-left:8px;">(Auto-tune finds the largest safe GPU layer count; probe checks instance attributes and a short timing)</small>
+                </div>
+                <div style="margin-top:8px; font-family: monospace; font-size:0.92em; color:#222;"><pre id="autotune-log" style="white-space:pre-wrap; background:#fff; border:1px solid #ddd; padding:8px; max-height:200px; overflow:auto;">Autotune log...</pre></div>
+                <div style="margin-top:8px;"><pre id="probe-log" style="white-space:pre-wrap; background:#fff; border:1px solid #ddd; padding:8px; max-height:200px; overflow:auto;">Probe results will appear here.</pre></div>
+            </div>
+        </div>
+    '''
+
+    html = html.replace('<h2>LLM Server</h2>', f'<h2>LLM Server</h2>\n        {status_html}\n        {diag_html}')
+
+    # Inject a small script to handle the Run GPU test button
+    html = html.replace('</body>', '''
+        <script>
+        document.getElementById('run-diag').addEventListener('click', async function () {
+            const btn = this;
+            const textEl = document.getElementById('diag-last-test-text');
+            btn.disabled = true; textEl.textContent = 'Running test...';
+            try {
+                const r = await fetch('/llm_diag', {method: 'POST'});
+                const j = await r.json();
+                if (r.ok) {
+                    textEl.textContent = `Result: ${j.ok ? 'OK' : 'FAIL'} ${j.param ? j.param+ '=' + j.layers : ''} Time: ${j.seconds ? j.seconds.toFixed(2)+'s' : ''} ${j.msg || ''}`;
+                    // Update connection label if success
+                    if (j.ok) {
+                        const conn = document.getElementById('diag-connection');
+                        conn.innerHTML = 'Connection: <strong>GPU</strong>';
+                    }
+                } else {
+                    textEl.textContent = 'Error: ' + r.status + ' ' + JSON.stringify(j);
+                }
+            } catch (e) {
+                textEl.textContent = 'Request failed: ' + String(e);
+            } finally {
+                btn.disabled = false;
+            }
+        });
+
+        // Auto-tune button - uses EventSource to stream progress
+        document.getElementById('run-autotune').addEventListener('click', function () {
+            const btn = this;
+            const log = document.getElementById('autotune-log');
+            log.textContent = 'Starting autotune...\n';
+            btn.disabled = true;
+            // Open EventSource (GET streaming endpoint)
+            const es = new EventSource('/llm_autotune?stream=1&mode=fast'); // fast mode by default (coarse doubling only)
+            es.addEventListener('progress', function(evt) {
+                try {
+                    const d = JSON.parse(evt.data);
+                    log.textContent += `[${new Date().toLocaleTimeString()}] TRY param=${d.param} layers=${d.layers} ok=${d.ok} t=${d.seconds ? d.seconds.toFixed(2)+'s' : ''} ${d.msg||''}\n`;
+                    log.scrollTop = log.scrollHeight;
+                } catch(e) {
+                    log.textContent += 'Malformed progress: ' + evt.data + '\n';
+                }
+            });
+            es.addEventListener('result', function(evt) {
+                try {
+                    const d = JSON.parse(evt.data);
+                    log.textContent += `RESULT: recommended layers=${d.recommended} param=${d.param} took=${d.total_seconds ? d.total_seconds.toFixed(2)+'s' : ''}\n`;
+                    // If success, update UI labels
+                    if (d.recommended) {
+                        const conn = document.getElementById('diag-connection');
+                        conn.innerHTML = 'Connection: <strong>GPU</strong>';
+                        const gparam = document.getElementById('diag-gpu');
+                        gparam.innerHTML = `GPU param: <strong>${d.param}</strong> layers: <strong>${d.recommended}</strong>`;
+                        const textEl = document.getElementById('diag-last-test-text');
+                        textEl.textContent = `Auto-tune result: ${d.recommended} layers (param ${d.param})`;
+                    }
+                } catch (e) {
+                    log.textContent += 'Malformed result: ' + evt.data + '\n';
+                }
+                es.close();
+                btn.disabled = false;
+            });
+            es.addEventListener('error', function(evt) {
+                log.textContent += 'Autotune failed or closed.\n';
+                es.close();
+                btn.disabled = false;
+            });
+
+        // Probe button
+        document.getElementById('run-probe').addEventListener('click', async function () {
+            const btn = this;
+            const plog = document.getElementById('probe-log');
+            plog.textContent = 'Running probe...';
+            btn.disabled = true;
+            try {
+                const r = await fetch('/llm_probe');
+                const j = await r.json();
+                if (r.ok) {
+                    plog.textContent = JSON.stringify(j, null, 2);
+                } else {
+                    plog.textContent = 'Error: ' + r.status + ' ' + JSON.stringify(j);
+                }
+            } catch (e) {
+                plog.textContent = 'Request failed: ' + String(e);
+            } finally {
+                btn.disabled = false;
+            }
+        });
+        });
+        </script>
+        </body>''')
+
     return HTMLResponse(content=html)
 
 
@@ -628,12 +962,43 @@ async def ask(request: Request, req: AskRequest):
         if req.generation_params:
             gen.update(req.generation_params)
 
+        # Respect device preference per-request: 'auto' (default), 'gpu', or 'cpu'
+        device_pref = (req.device_preference or 'auto').strip().lower()
+        tmp_llm_inst = None
+        tmp_created = False
+        if device_pref == 'gpu':
+            if not llm_available:
+                raise HTTPException(status_code=500, detail='Local LLM not loaded')
+            # If server already has a verified GPU, proceed; otherwise attempt a one-off verified GPU instantiation
+            if not (getattr(app.state, 'llm_has_gpu', False) and getattr(app.state, 'llm_gpu_verified', False)):
+                try:
+                    tmp_llm_inst = await asyncio.to_thread(create_llama_instance, app.state.llm_model_path, verify_gpu=True)
+                    tmp_created = True
+                except Exception as e:
+                    logging.warning('Per-request GPU verification failed: %s', str(e))
+                    raise HTTPException(status_code=503, detail='GPU not available or could not be verified')
+        elif device_pref == 'cpu':
+            try:
+                tmp_llm_inst = await asyncio.to_thread(create_llama_instance, app.state.llm_model_path, force_cpu=True)
+                tmp_created = True
+            except Exception as e:
+                logging.warning('Per-request CPU instance creation failed: %s', str(e))
+                raise HTTPException(status_code=500, detail='Failed to create CPU instance')
+
         if stream_requested:
             async def event_stream():
-                yield f"event: provider\ndata: local\n\n"
+                # Determine display provider for UI (GPU vs CPU ONLY) using request preference and tmp instance
+                if tmp_llm_inst is not None:
+                    display_provider = 'GPU' if device_pref == 'gpu' else 'CPU ONLY'
+                else:
+                    display_provider = 'GPU' if getattr(app.state, 'llm_has_gpu', False) and getattr(app.state, 'llm_gpu_verified', False) and device_pref != 'cpu' else 'CPU ONLY'
+                yield f"event: provider\ndata: {display_provider}\n\n"
                 # Acquire a model instance for the duration of the stream
                 try:
-                    llm_inst = await acquire_llm_instance()
+                    if tmp_llm_inst is not None:
+                        llm_inst = tmp_llm_inst
+                    else:
+                        llm_inst = await acquire_llm_instance(force_cpu=(device_pref == 'cpu'))
                 except Exception as e:
                     logging.exception('Failed to acquire LLM instance for streaming: %s', e)
                     yield f"event: error\ndata: {str(e)}\n\n"
@@ -666,7 +1031,15 @@ async def ask(request: Request, req: AskRequest):
                     yield f"event: error\ndata: {str(e)}\n\n"
                 finally:
                     try:
-                        release_llm_instance(llm_inst)
+                        if tmp_created:
+                            # close and drop the temporary instance
+                            if hasattr(llm_inst, 'close'):
+                                try:
+                                    llm_inst.close()
+                                except Exception:
+                                    pass
+                        else:
+                            release_llm_instance(llm_inst)
                     except Exception:
                         pass
             return StreamingResponse(event_stream(), media_type='text/event-stream')
@@ -674,7 +1047,10 @@ async def ask(request: Request, req: AskRequest):
         try:
             # Acquire instance and run blocking creation in a threadpool to avoid blocking the event loop
             try:
-                llm_inst = await acquire_llm_instance()
+                if tmp_llm_inst is not None:
+                    llm_inst = tmp_llm_inst
+                else:
+                    llm_inst = await acquire_llm_instance(force_cpu=(device_pref == 'cpu'))
             except Exception as e:
                 logging.exception('Failed to acquire LLM instance: %s', e)
                 raise HTTPException(status_code=500, detail=str(e))
@@ -684,14 +1060,25 @@ async def ask(request: Request, req: AskRequest):
                 elapsed = time.time() - start
             finally:
                 try:
-                    release_llm_instance(llm_inst)
+                    if tmp_created:
+                        if hasattr(llm_inst, 'close'):
+                            try:
+                                llm_inst.close()
+                            except Exception:
+                                pass
+                    else:
+                        release_llm_instance(llm_inst)
                 except Exception:
                     pass
             content = response['choices'][0]['message'].get('content') if response and 'choices' in response else ''
             text = content.strip() if content else ''
             tokens_est = max(1, int(len(text) / 4))
             tok_per_sec = (tokens_est / elapsed) if elapsed > 0 else tokens_est
-            return {'response': text, 'provider': provider, 'tokens': tokens_est, 'seconds': elapsed, 'tok_per_sec': tok_per_sec}
+            if tmp_llm_inst is not None:
+                display_provider = 'GPU' if device_pref == 'gpu' else 'CPU ONLY'
+            else:
+                display_provider = 'GPU' if getattr(app.state, 'llm_has_gpu', False) and getattr(app.state, 'llm_gpu_verified', False) and device_pref != 'cpu' else 'CPU ONLY'
+            return {'response': text, 'provider': display_provider, 'tokens': tokens_est, 'seconds': elapsed, 'tok_per_sec': tok_per_sec}
         except Exception as e:
             logging.exception('LLM generation error: %s', e)
             raise HTTPException(status_code=500, detail=str(e))
@@ -716,6 +1103,336 @@ def shutdown(request: Request):
     return {'status': 'shutting_down'}
 
 
+@app.post('/llm_diag')
+async def llm_diag(request: Request):
+    """Run a brief diagnostic GPU instantiation test and return results.
+
+    This attempts to instantiate a temporary Llama model with common GPU kwargs and returns
+    timing/error information. Only run on-demand via the UI to avoid startup overhead.
+    """
+    if Llama is None:
+        raise HTTPException(status_code=500, detail='llama_cpp not installed')
+    model_path = getattr(app.state, 'llm_model_path', None)
+    if not model_path or not Path(model_path).exists():
+        raise HTTPException(status_code=500, detail='Local model not configured or not found')
+
+    # Decide layers to try
+    try:
+        layers = int(os.environ.get('LLM_GPU_LAYERS', os.environ.get('LLM_N_GPU_LAYERS', '8')))
+    except Exception:
+        layers = 8
+
+    params = ['gpu_layers', 'n_gpu_layers']
+    tried = []
+    start_total = time.time()
+    for p in params:
+        start = time.time()
+        try:
+            # Try instantiation with this param on a thread to avoid blocking event loop
+            inst = await asyncio.to_thread(Llama, model_path=model_path, **{p: layers}, n_ctx=int(os.environ.get('LLM_N_CTX', '8192')), n_threads=int(os.environ.get('LLM_N_THREADS', '4')))
+            elapsed = time.time() - start
+            # Mark server state as GPU-capable and verified
+            try:
+                app.state.llm_last_gpu_param = p
+                app.state.llm_last_gpu_layers = layers
+                app.state.llm_has_gpu = True
+                app.state.llm_gpu_verified = True
+            except Exception:
+                pass
+            # Cleanup
+            try:
+                # llama-cpp python sometimes exposes a .close or similar; attempt gentle cleanup
+                if hasattr(inst, 'close'):
+                    try:
+                        inst.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            try:
+                del inst
+            except Exception:
+                pass
+            import gc; gc.collect()
+            result = {'ok': True, 'param': p, 'layers': layers, 'seconds': elapsed, 'msg': 'OK', 'time': time.time()}
+            app.state.llm_diag = result
+            return result
+        except TypeError as e:
+            tried.append({'param': p, 'error': str(e)})
+            continue
+        except Exception as e:
+            tried.append({'param': p, 'error': str(e)})
+            continue
+
+    elapsed_total = time.time() - start_total
+    result = {'ok': False, 'param': None, 'layers': None, 'seconds': elapsed_total, 'msg': 'All attempts failed', 'tried': tried, 'time': time.time()}
+    app.state.llm_diag = result
+    return result
+
+
+@app.get('/llm_autotune')
+async def llm_autotune(request: Request):
+    """Query param: mode=fast to skip binary search (fast doubling only)."""
+    """Auto-tune GPU layer count. Streams progress as SSE if `stream=1` query parameter is present.
+
+    Algorithm: find param that works at a small layer count, then exponentially increase until failure or max,
+    then binary-search the maximum working layer count.
+    """
+    if Llama is None:
+        raise HTTPException(status_code=500, detail='llama_cpp not installed')
+    model_path = getattr(app.state, 'llm_model_path', None)
+    if not model_path or not Path(model_path).exists():
+        raise HTTPException(status_code=500, detail='Local model not configured or not found')
+
+    # config
+    max_layers = int(os.environ.get('LLM_AUTOTUNE_MAX', os.environ.get('LLM_GPU_LAYERS_MAX', '4096')))
+    start = int(os.environ.get('LLM_AUTOTUNE_START', os.environ.get('LLM_GPU_LAYERS', '8')))
+    max_time = float(os.environ.get('LLM_AUTOTUNE_MAX_TIME', '30'))  # per trial seconds timeout heuristic
+
+    async def autotune_stream():
+        tried = []
+        start_time = time.time()
+        # First, find which param name works at `start`
+        param_name = None
+        for p in ('gpu_layers', 'n_gpu_layers'):
+            try:
+                t0 = time.time()
+                inst = await asyncio.to_thread(Llama, model_path=model_path, **{p: start}, n_ctx=int(os.environ.get('LLM_N_CTX', '8192')), n_threads=int(os.environ.get('LLM_N_THREADS', '4')))
+                elapsed = time.time() - t0
+                # close if possible
+                try:
+                    if hasattr(inst, 'close'):
+                        inst.close()
+                except Exception:
+                    pass
+                del inst
+                tried.append({'param': p, 'layers': start, 'ok': True, 'seconds': elapsed})
+                yield f"event: progress\ndata: {json.dumps(tried[-1])}\n\n"
+                param_name = p
+                break
+            except TypeError as e:
+                tried.append({'param': p, 'layers': start, 'ok': False, 'error': str(e)})
+                yield f"event: progress\ndata: {json.dumps(tried[-1])}\n\n"
+                continue
+            except Exception as e:
+                tried.append({'param': p, 'layers': start, 'ok': False, 'error': str(e)})
+                yield f"event: progress\ndata: {json.dumps(tried[-1])}\n\n"
+                continue
+
+        if not param_name:
+            yield f"event: result\ndata: {json.dumps({'ok': False, 'msg': 'No supported GPU param found'})}\n\n"
+            return
+
+        # exponential growth phase
+        lo = start
+        hi = None
+        cur = start
+        last_ok = start
+        fast_mode = (request.query_params.get('mode') == 'fast') or (request.query_params.get('fast') in ('1','true'))
+        while cur <= max_layers:
+            try:
+                t0 = time.time()
+                inst = await asyncio.to_thread(Llama, model_path=model_path, **{param_name: cur}, n_ctx=int(os.environ.get('LLM_N_CTX', '8192')), n_threads=int(os.environ.get('LLM_N_THREADS', '4')))
+                elapsed = time.time() - t0
+                try:
+                    if hasattr(inst, 'close'):
+                        inst.close()
+                except Exception:
+                    pass
+                del inst
+                tried.append({'param': param_name, 'layers': cur, 'ok': True, 'seconds': elapsed})
+                last_ok = cur
+                yield f"event: progress\ndata: {json.dumps(tried[-1])}\n\n"
+                # increase
+                if cur == 0:
+                    cur = 1
+                else:
+                    cur = cur * 2
+                if cur > max_layers:
+                    hi = max_layers + 1
+                    break
+            except Exception as e:
+                tried.append({'param': param_name, 'layers': cur, 'ok': False, 'error': str(e)})
+                yield f"event: progress\ndata: {json.dumps(tried[-1])}\n\n"
+                hi = cur
+                break
+
+        # Fast mode: do not run binary search; accept last_ok as recommended (very fast)
+        if fast_mode:
+            recommended = last_ok
+            total_seconds = time.time() - start_time
+            result = {'ok': True, 'recommended': recommended, 'param': param_name, 'total_seconds': total_seconds, 'fast_mode': True}
+            app.state.llm_diag = {'ok': True, 'param': param_name, 'layers': recommended, 'seconds': total_seconds, 'msg': 'autotune-fast', 'time': time.time()}
+            yield f"event: result\ndata: {json.dumps(result)}\n\n"
+            return
+
+        if hi is None:
+            # never failed up to max_layers; use last_ok
+            recommended = last_ok
+            total_seconds = time.time() - start_time
+            result = {'ok': True, 'recommended': recommended, 'param': param_name, 'total_seconds': total_seconds}
+            app.state.llm_diag = {'ok': True, 'param': param_name, 'layers': recommended, 'seconds': total_seconds, 'msg': 'autotune', 'time': time.time()}
+            yield f"event: result\ndata: {json.dumps(result)}\n\n"
+            return
+
+        # binary search between last_ok and hi-1
+        lo = last_ok
+        hi = hi
+        # ensure lo < hi
+        if lo >= hi:
+            recommended = lo
+        else:
+            while lo + 1 < hi:
+                mid = (lo + hi) // 2
+                try:
+                    t0 = time.time()
+                    inst = await asyncio.to_thread(Llama, model_path=model_path, **{param_name: mid}, n_ctx=int(os.environ.get('LLM_N_CTX', '8192')), n_threads=int(os.environ.get('LLM_N_THREADS', '4')))
+                    elapsed = time.time() - t0
+                    try:
+                        if hasattr(inst, 'close'):
+                            inst.close()
+                    except Exception:
+                        pass
+                    del inst
+                    tried.append({'param': param_name, 'layers': mid, 'ok': True, 'seconds': elapsed})
+                    yield f"event: progress\ndata: {json.dumps(tried[-1])}\n\n"
+                    lo = mid
+                except Exception as e:
+                    tried.append({'param': param_name, 'layers': mid, 'ok': False, 'error': str(e)})
+                    yield f"event: progress\ndata: {json.dumps(tried[-1])}\n\n"
+                    hi = mid
+            recommended = lo
+
+        total_seconds = time.time() - start_time
+        result = {'ok': True, 'recommended': recommended, 'param': param_name, 'tried': tried, 'total_seconds': total_seconds}
+        app.state.llm_diag = {'ok': True, 'param': param_name, 'layers': recommended, 'seconds': total_seconds, 'msg': 'autotune', 'time': time.time()}
+        # Optionally preload: environment variable LLM_AUTOTUNE_PRELOAD=1 will preload instance with recommended layers
+        try:
+            if os.environ.get('LLM_AUTOTUNE_PRELOAD', '').strip().lower() in ('1', 'true', 'yes'):
+                try:
+                    # Temporarily set chosen GPU layers so create_llama_instance will use them
+                    old_val = os.environ.get('LLM_GPU_LAYERS')
+                    os.environ['LLM_GPU_LAYERS'] = str(recommended)
+                    inst = create_llama_instance(model_path, verify_gpu=True)
+                    # Restore old env
+                    if old_val is None:
+                        del os.environ['LLM_GPU_LAYERS']
+                    else:
+                        os.environ['LLM_GPU_LAYERS'] = old_val
+                    # Drop existing preloaded instance and replace
+                    try:
+                        q = app.state.llm_pool
+                        q.put_nowait(inst)
+                        app.state.llm_pool_count = getattr(app.state, 'llm_pool_count', 0) + 1
+                        app.state.llm = inst
+                        logging.info('Preloaded Llama instance after autotune: %s=%s (verified=%s)', param_name, recommended, getattr(app.state, 'llm_gpu_verified', False))
+                    except Exception:
+                        # If pool full, just set llm for compatibility
+                        app.state.llm = inst
+                except Exception:
+                    logging.warning('Autotune preload failed')
+        except Exception:
+            pass
+        yield f"event: result\ndata: {json.dumps(result)}\n\n"
+
+    if request.query_params.get('stream') in ('1','true'):
+        return StreamingResponse(autotune_stream(), media_type='text/event-stream')
+    # otherwise run a full autotune synchronously and return json
+    # Run and collect
+    out = []
+    async for ev in autotune_stream():
+        out.append(ev)
+    # last event contains the result JSON inside 'event: result\ndata: ...'
+    # extract final result from app.state.llm_diag and return it
+    return app.state.llm_diag
+
+
+@app.get('/llm_probe')
+async def llm_probe():
+    """Probe a Llama instance: report GPU-related attributes and run a short timed generation (small token count).
+
+    Returns JSON with attributes, a short timing, and optional nvidia-smi before/after memory snapshots.
+    """
+    if Llama is None:
+        raise HTTPException(status_code=500, detail='llama_cpp not installed')
+    model_path = getattr(app.state, 'llm_model_path', None)
+    if not model_path or not Path(model_path).exists():
+        raise HTTPException(status_code=500, detail='Local model not configured or not found')
+
+    # Optional small generation to measure speed: short prompt, few tokens
+    probe_prompt = os.environ.get('LLM_PROBE_PROMPT', 'The quick brown fox')
+    probe_max_tokens = int(os.environ.get('LLM_PROBE_TOKENS', '24'))
+
+    smi_before = None
+    smi_after = None
+    # Capture nvidia-smi memory used if available
+    try:
+        p = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=3)
+        if p.returncode == 0 and p.stdout.strip():
+            smi_before = [int(x.strip()) for x in p.stdout.strip().splitlines()]
+    except Exception:
+        smi_before = None
+
+    llm_inst = None
+    inst_info = {'attrs': {}, 'has_gpu_attr': False}
+    start = time.time()
+    try:
+        # Acquire an instance (may create temporary)
+        llm_inst = await acquire_llm_instance()
+        # Inspect instance attributes for GPU indicators
+        for name in dir(llm_inst):
+            if 'gpu' in name.lower() or 'cuda' in name.lower() or 'device' in name.lower():
+                try:
+                    val = getattr(llm_inst, name)
+                    # Represent simple values only
+                    if isinstance(val, (int, float, str, bool)):
+                        inst_info['attrs'][name] = val
+                    else:
+                        # For callables/complex attrs, mark presence
+                        inst_info['attrs'][name] = str(type(val))
+                    inst_info['has_gpu_attr'] = True
+                except Exception:
+                    inst_info['attrs'][name] = 'ERROR'
+        # Try a short generation to measure tokens/sec
+        t0 = time.time()
+        response = await asyncio.to_thread(llm_inst.create_chat_completion, messages=[{'role':'user','content':probe_prompt}], max_tokens=probe_max_tokens, temperature=0.1)
+        t1 = time.time()
+        content = response['choices'][0]['message'].get('content') if response and 'choices' in response else ''
+        elapsed = t1 - t0
+        tokens_est = max(1, int(len(content) / 4))
+        tok_per_sec = (tokens_est / elapsed) if elapsed > 0 else tokens_est
+        probe_res = {'seconds': elapsed, 'tokens': tokens_est, 'tok_per_sec': tok_per_sec, 'content_sample': (content or '')[:200]}
+    except Exception as e:
+        probe_res = {'error': str(e)}
+    finally:
+        try:
+            if llm_inst:
+                release_llm_instance(llm_inst)
+        except Exception:
+            pass
+
+    try:
+        p = subprocess.run(['nvidia-smi', '--query-gpu=memory.used', '--format=csv,noheader,nounits'], capture_output=True, text=True, timeout=3)
+        if p.returncode == 0 and p.stdout.strip():
+            smi_after = [int(x.strip()) for x in p.stdout.strip().splitlines()]
+    except Exception:
+        smi_after = None
+
+    result = {
+        'timestamp': time.time(),
+        'llm_has_gpu': getattr(app.state, 'llm_has_gpu', False),
+        'llm_use_gpu': getattr(app.state, 'llm_use_gpu', False),
+        'llm_last_gpu_param': getattr(app.state, 'llm_last_gpu_param', None),
+        'llm_last_gpu_layers': getattr(app.state, 'llm_last_gpu_layers', None),
+        'inst_info': inst_info,
+        'probe': probe_res,
+        'smi_before': smi_before,
+        'smi_after': smi_after,
+    }
+    app.state.llm_last_probe = result
+    return result
+
+
 @app.get('/llm_status')
 def llm_status():
     gemini = getattr(app.state, 'gemini_model', None)
@@ -736,7 +1453,20 @@ def llm_status():
         ok = False
 
     url = os.environ.get('LLM_SERVER_URL', 'http://ashy.tplinkdns.com:5005/ask')
-    return {'ok': ok, 'status': 'Connected' if ok else 'Not connected', 'provider': provider, 'url': url, 'pool_max': pool_max, 'pool_count': pool_count, 'pool_idle': pool_idle}
+    return {
+        'ok': ok,
+        'status': 'Connected' if ok else 'Not connected',
+        'provider': provider,
+        'url': url,
+        'pool_max': pool_max,
+        'pool_count': pool_count,
+        'pool_idle': pool_idle,
+        'gpu': getattr(app.state, 'llm_use_gpu', False),
+        'gpu_param': getattr(app.state, 'llm_last_gpu_param', None),
+        'gpu_layers': getattr(app.state, 'llm_last_gpu_layers', None),
+        'gpu_verified': getattr(app.state, 'llm_gpu_verified', False),
+        'last_diag': getattr(app.state, 'llm_diag', None)
+    }
 
 
 if __name__ == '__main__':
@@ -773,8 +1503,44 @@ if __name__ == '__main__':
 
     def stop_server(timeout=3):
         if not PID_FILE.exists():
-            print('No PID file found; server may not be running.')
+            print('No PID file found; attempting to locate running server processes...')
+            # Try to find likely server processes (fallback when PID file missing)
+            try:
+                p = subprocess.run(['pgrep', '-f', 'llm_server'], capture_output=True, text=True)
+                out = (p.stdout or '').strip()
+                if not out:
+                    print('No running server processes found.')
+                    return
+                pids = [int(x) for x in out.split() if x.strip().isdigit()]
+            except Exception:
+                print('Failed to query processes for llm_server. No PID file and cannot discover process.')
+                return
+
+            stopped_any = False
+            for pid in pids:
+                try:
+                    print(f'Attempting to stop process PID {pid}...')
+                    os.kill(pid, signal.SIGTERM)
+                    for _ in range(timeout * 10):
+                        time.sleep(0.1)
+                        try:
+                            os.kill(pid, 0)
+                        except Exception:
+                            break
+                    else:
+                        os.kill(pid, signal.SIGKILL)
+                    print(f'Stopped server (PID {pid}).')
+                    stopped_any = True
+                except ProcessLookupError:
+                    print(f'Process {pid} not found.')
+                except PermissionError:
+                    print(f'Permission denied when trying to stop process {pid}.')
+                except Exception as e:
+                    print(f'Failed to stop process {pid}: {e}')
+            if not stopped_any:
+                print('No processes were stopped.')
             return
+
         try:
             pid = int(PID_FILE.read_text().strip())
         except Exception:
