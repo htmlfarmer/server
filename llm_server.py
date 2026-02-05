@@ -184,11 +184,20 @@ def create_llama_instance(model_path: str, verify_gpu: bool = False):
         pass
     return Llama(**base_kwargs)
 
+# Prefer explicit import of the generative AI submodule if available
 try:
-    import google as genai
+    import google.generativeai as genai
 except Exception as e:
-    logging.error(f"Failed to import google genai: {e}")
-    genai = None
+    logging.warning('Failed to import google.generativeai directly: %s', e)
+    # Fallback: the `google` package may expose a `generativeai` attribute
+    try:
+        import google as google_pkg
+        genai = getattr(google_pkg, 'generativeai', None)
+        if genai is None:
+            logging.error('google package imported but has no attribute generativeai')
+    except Exception as e2:
+        logging.error('Failed to import google package: %s', e2)
+        genai = None
 
 APP_DIR = Path(__file__).resolve().parent
 PID_FILE = APP_DIR / '.llm_server_pid'
@@ -249,7 +258,12 @@ async def lifespan(app: FastAPI):
     gemini_key = os.environ.get('GEMINI_API_KEY')
     logging.info('Checking Gemini initialization... Key present: %s, genai module present: %s',
                  bool(gemini_key), bool(genai))
-    
+
+    # Expose helpful flags on app.state for diagnostics/UI
+    app.state.gemini_key_present = bool(gemini_key)
+    app.state.genai_present = bool(genai)
+    app.state.gemini_init_error = None
+
     if genai and gemini_key:
         try:
             genai.configure(api_key=gemini_key.strip())
@@ -260,12 +274,17 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logging.exception('Failed to initialize Gemini: %s', e)
             app.state.gemini_model = None
+            app.state.gemini_init_error = str(e)
     else:
         app.state.gemini_model = None
         if not gemini_key:
-            logging.warning('Gemini API key NOT found in environment. Check your .env file at %s', APP_DIR / '.env')
+            msg = f'Gemini API key NOT found in environment. Check your .env file at {APP_DIR / ".env"}'
+            logging.warning(msg)
+            app.state.gemini_init_error = msg
         if not genai:
-            logging.error('google-generativeai package is not installed or failed to import.')
+            msg = 'google-generativeai package is not installed or failed to import.'
+            logging.error(msg)
+            app.state.gemini_init_error = (app.state.gemini_init_error or '') + ' ' + msg
 
     try:
         app.state.llm_lock = asyncio.Lock()
@@ -512,9 +531,23 @@ def index():
 
                     const ct = (r.headers.get('content-type') || '').toLowerCase();
                     if (ct.includes('application/json')) {
-                        const j = await r.json();
+                        let j = {};
+                        try {
+                            j = (await r.json()) || {};
+                        } catch (e) {
+                            j = {};
+                        }
+                        // If server returned an error detail, show it clearly
+                        if (j.detail) {
+                            respEl.textContent = 'Error: ' + (j.detail || '');
+                            providerEl.textContent = j.provider || payload.provider || 'unknown';
+                            statsEl.textContent = '';
+                            conversation.pop();
+                            renderConversation();
+                            return;
+                        }
                         respEl.textContent = j.response || '';
-                        providerEl.textContent = j.provider || 'unknown';
+                        providerEl.textContent = j.provider || payload.provider || 'unknown';
                         if (j.tokens) {
                             statsEl.textContent = `Tokens: ${j.tokens}, ${(j.tok_per_sec||0).toFixed(1)} tok/s, Time: ${(j.seconds||0).toFixed(2)}s`;
                         } else {
@@ -548,6 +581,14 @@ def index():
                                     statsEl.textContent = `Tokens: ${s.tokens}, ${s.tok_per_sec.toFixed(1)} tok/s, Time: ${s.seconds.toFixed(2)}s`;
                                 } catch(e) {}
                                 continue;
+                            }
+                            if (part.startsWith('event: error')) {
+                                const data = part.split('data: ')[1] || '';
+                                respEl.textContent = 'Error: ' + data;
+                                statsEl.textContent = '';
+                                conversation.pop(); // remove optimistic user message
+                                renderConversation();
+                                return;
                             }
                             const lines = part.split('\\n');
                             const dataLines = lines.filter(l => l.startsWith('data:'));
@@ -706,7 +747,12 @@ def index():
             btn.disabled = true; textEl.textContent = 'Running test...';
             try {
                 const r = await fetch('/llm_diag', {method: 'POST'});
-                const j = await r.json();
+                let j = {};
+                try {
+                    j = (await r.json()) || {};
+                } catch (e2) {
+                    j = {};
+                }
                 if (r.ok) {
                     textEl.textContent = `Result: ${j.ok ? 'OK' : 'FAIL'} ${j.param ? j.param+ '=' + j.layers : ''} Time: ${j.seconds ? j.seconds.toFixed(2)+'s' : ''} ${j.msg || ''}`;
                     // Update connection label if success
@@ -728,23 +774,23 @@ def index():
         document.getElementById('run-autotune').addEventListener('click', function () {
             const btn = this;
             const log = document.getElementById('autotune-log');
-            log.textContent = 'Starting autotune...\n';
+            log.textContent = 'Starting autotune...\\n';
             btn.disabled = true;
             // Open EventSource (GET streaming endpoint)
             const es = new EventSource('/llm_autotune?stream=1&mode=fast'); // fast mode by default (coarse doubling only)
             es.addEventListener('progress', function(evt) {
                 try {
                     const d = JSON.parse(evt.data);
-                    log.textContent += `[${new Date().toLocaleTimeString()}] TRY param=${d.param} layers=${d.layers} ok=${d.ok} t=${d.seconds ? d.seconds.toFixed(2)+'s' : ''} ${d.msg||''}\n`;
+                    log.textContent += `[${new Date().toLocaleTimeString()}] TRY param=${d.param} layers=${d.layers} ok=${d.ok} t=${d.seconds ? d.seconds.toFixed(2)+'s' : ''} ${d.msg||''}\\n`;
                     log.scrollTop = log.scrollHeight;
                 } catch(e) {
-                    log.textContent += 'Malformed progress: ' + evt.data + '\n';
+                    log.textContent += 'Malformed progress: ' + evt.data + '\\n';
                 }
             });
             es.addEventListener('result', function(evt) {
                 try {
                     const d = JSON.parse(evt.data);
-                    log.textContent += `RESULT: recommended layers=${d.recommended} param=${d.param} took=${d.total_seconds ? d.total_seconds.toFixed(2)+'s' : ''}\n`;
+                    log.textContent += `RESULT: recommended layers=${d.recommended} param=${d.param} took=${d.total_seconds ? d.total_seconds.toFixed(2)+'s' : ''}\\n`;
                     // If success, update UI labels
                     if (d.recommended) {
                         const conn = document.getElementById('diag-connection');
@@ -755,13 +801,13 @@ def index():
                         textEl.textContent = `Auto-tune result: ${d.recommended} layers (param ${d.param})`;
                     }
                 } catch (e) {
-                    log.textContent += 'Malformed result: ' + evt.data + '\n';
+                    log.textContent += 'Malformed result: ' + evt.data + '\\n';
                 }
                 es.close();
                 btn.disabled = false;
             });
             es.addEventListener('error', function(evt) {
-                log.textContent += 'Autotune failed or closed.\n';
+                log.textContent += 'Autotune failed or closed.\\n';
                 es.close();
                 btn.disabled = false;
             });
@@ -774,7 +820,12 @@ def index():
             btn.disabled = true;
             try {
                 const r = await fetch('/llm_probe');
-                const j = await r.json();
+                let j = {};
+                try {
+                    j = (await r.json()) || {};
+                } catch (e2) {
+                    j = {};
+                }
                 if (r.ok) {
                     plog.textContent = JSON.stringify(j, null, 2);
                 } else {
@@ -1433,6 +1484,49 @@ async def llm_probe():
     return result
 
 
+@app.get('/gemini_test')
+async def gemini_test():
+    """Run a minimal Gemini request to verify initialization and return diagnostic info.
+
+    Returns JSON with 'ok': True and a short 'response' when successful, or raises
+    HTTP 500 with 'detail' describing the error when Gemini is not configured or the
+    request fails.
+    """
+    if genai is None:
+        raise HTTPException(status_code=500, detail='google-generativeai package not installed')
+    gemini_model_name = getattr(app.state, 'gemini_model_name', GEMINI_MODEL_NAME)
+    if not getattr(app.state, 'gemini_model', None):
+        raise HTTPException(status_code=500, detail='Gemini not initialized (missing API key or failed init)')
+
+    try:
+        def _call():
+            # Use a very small request to test the service. Prefer the configured model name.
+            chat_model = genai.GenerativeModel(model_name=gemini_model_name, system_instruction='You are a helpful assistant.')
+            chat = chat_model.start_chat()
+            resp = chat.send_message('2+9')
+            # Try to extract text robustly
+            text = ''
+            try:
+                if hasattr(resp, 'text') and resp.text:
+                    text = resp.text
+                elif getattr(resp, 'candidates', None):
+                    cand = resp.candidates[0]
+                    text = getattr(cand, 'content', None) or getattr(cand, 'text', None) or str(cand)
+                else:
+                    text = str(resp)
+            except Exception:
+                text = str(resp)
+            return {'response': text}
+
+        start = time.time()
+        result = await asyncio.to_thread(_call)
+        elapsed = time.time() - start
+        return {'ok': True, 'model': gemini_model_name, 'elapsed': elapsed, 'result': result}
+    except Exception as e:
+        logging.exception('Gemini diagnostic failed: %s', e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get('/llm_status')
 def llm_status():
     gemini = getattr(app.state, 'gemini_model', None)
@@ -1465,7 +1559,11 @@ def llm_status():
         'gpu_param': getattr(app.state, 'llm_last_gpu_param', None),
         'gpu_layers': getattr(app.state, 'llm_last_gpu_layers', None),
         'gpu_verified': getattr(app.state, 'llm_gpu_verified', False),
-        'last_diag': getattr(app.state, 'llm_diag', None)
+        'last_diag': getattr(app.state, 'llm_diag', None),
+        # Gemini diagnostic flags
+        'gemini_key_present': getattr(app.state, 'gemini_key_present', False),
+        'genai_present': getattr(app.state, 'genai_present', False),
+        'gemini_init_error': getattr(app.state, 'gemini_init_error', None)
     }
 
 
@@ -1583,9 +1681,16 @@ if __name__ == '__main__':
     sbg.add_argument('--log', default='/tmp/llm_server.log', help='Log file for background server')
     sub.add_parser('stop', help='Stop server using PID file')
     sub.add_parser('status', help='Show server status')
+    restart_parser = sub.add_parser('restart', help='Restart server (stop then start-bg)')
+    restart_parser.add_argument('--log', default='/tmp/llm_server.log', help='Log file for background server (used when starting)')
     args = parser.parse_args()
 
     if args.cmd == 'start-bg':
+        start_background(logfile=args.log)
+    elif args.cmd == 'restart':
+        # Restart: stop any running server then start in background using provided log path
+        stop_server()
+        time.sleep(0.5)
         start_background(logfile=args.log)
     elif args.cmd == 'stop':
         stop_server()
