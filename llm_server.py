@@ -841,6 +841,15 @@ def index():
         </script>
         </body>''')
 
+    # If a local model path is configured, show its filename in the provider dropdown
+    try:
+        mpath = getattr(app.state, 'llm_model_path', None)
+        if mpath:
+            local_name = os.path.basename(mpath)
+            html = html.replace('Local Model (Llama/Gemma)', f'Local Model ({local_name})')
+    except Exception:
+        pass
+
     return HTMLResponse(content=html)
 
 
