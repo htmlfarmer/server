@@ -1,5 +1,6 @@
 # Ignore environment variable files
 .env
+.llm_server_pid
 
 # Python bytecode
 __pycache__/
