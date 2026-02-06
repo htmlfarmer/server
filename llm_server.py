@@ -6,17 +6,16 @@ Simple LLM HTTP server using FastAPI.
 - Supports streaming SSE responses and a small test UI with conversation support
 """
 
-import os
 import logging
+import os
 import threading
-from pathlib import Path
-from typing import Optional, Dict, Any, List
 import asyncio
-import re
 import time
 import json
+import warnings
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from contextlib import asynccontextmanager
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -24,13 +23,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+# Suppress noisy requests dependency warnings (seen with system Python)
+try:
+    from requests import RequestsDependencyWarning
+    warnings.filterwarnings("ignore", category=RequestsDependencyWarning)
+except Exception:
+    pass
+
 try:
     from llama_cpp import Llama
 except Exception:
     Llama = None
 
 # GPU detection and safe Llama factory
-import inspect
 import subprocess
 
 def _detect_cuda_hardware() -> bool:
@@ -66,6 +71,30 @@ def detect_cuda_available() -> bool:
     # Auto-detect
     return _detect_cuda_hardware()
 
+def _gpu_verify_strict() -> bool:
+    return os.environ.get('LLM_GPU_VERIFY_STRICT', '').strip().lower() in ('1', 'true', 'yes')
+
+def _resolve_gpu_layers(default_layers: int = 8) -> int:
+    env_val = os.environ.get('LLM_GPU_LAYERS', os.environ.get('LLM_N_GPU_LAYERS', '')).strip().lower()
+    if env_val in ('max', 'auto'):
+        try:
+            return int(os.environ.get('LLM_GPU_LAYERS_MAX', os.environ.get('LLM_AUTOTUNE_MAX', '4096')))
+        except Exception:
+            return 4096
+    if env_val:
+        try:
+            return int(env_val)
+        except Exception:
+            return default_layers
+    # Fall back to last known good layers from autotune/diagnostics if available
+    try:
+        last = getattr(app.state, 'llm_last_gpu_layers', None)
+        if isinstance(last, int) and last > 0:
+            return last
+    except Exception:
+        pass
+    return default_layers
+
 def _smi_memory_used():
     """Return list of memory.used values (MB) for each GPU, or None if not available."""
     try:
@@ -77,7 +106,12 @@ def _smi_memory_used():
     return None
 
 
-def create_llama_instance(model_path: str, verify_gpu: bool = False):
+def create_llama_instance(
+    model_path: str,
+    verify_gpu: bool = False,
+    force_cpu: bool = False,
+    force_gpu: bool = False,
+):
     """Create a Llama instance, attempting to use GPU if available and supported, falling back to CPU.
 
     Tries multiple possible GPU parameter names (`gpu_layers`, `n_gpu_layers`) to support different
@@ -92,17 +126,14 @@ def create_llama_instance(model_path: str, verify_gpu: bool = False):
                        n_ctx=int(os.environ.get('LLM_N_CTX', '8192')),
                        n_threads=int(os.environ.get('LLM_N_THREADS', '4')),
                        verbose=False)
-    # Try GPU if flagged on app.state (set during startup)
-    use_gpu = getattr(app.state, 'llm_use_gpu', False)
-    # If we've explicitly verified that GPU does NOT work, avoid attempting GPU unless verify_gpu=True
-    if use_gpu and (getattr(app.state, 'llm_gpu_verified', None) is False) and not verify_gpu:
+    # Try GPU if flagged on app.state (set during startup) or explicitly forced
+    use_gpu = (not force_cpu) and (force_gpu or getattr(app.state, 'llm_use_gpu', False))
+    # If we've previously failed to initialize GPU, skip unless explicitly verifying or forcing GPU
+    if use_gpu and not force_gpu and getattr(app.state, 'llm_gpu_init_failed', False) and not verify_gpu:
         use_gpu = False
     if use_gpu:
         # Determine desired gpu_layers from env or default
-        try:
-            gpu_layers = int(os.environ.get('LLM_GPU_LAYERS', os.environ.get('LLM_N_GPU_LAYERS', '8')))
-        except Exception:
-            gpu_layers = 8
+        gpu_layers = _resolve_gpu_layers(default_layers=8)
 
         tried = []
         # Try parameter names in order of preference
@@ -138,14 +169,14 @@ def create_llama_instance(model_path: str, verify_gpu: bool = False):
                                 verified = True
                                 break
 
-                if verify_gpu and not verified:
+                if verify_gpu and not verified and _gpu_verify_strict():
                     # Close and drop this instance and try next option or CPU fallback
                     try:
                         if hasattr(inst, 'close'):
                             inst.close()
                     except Exception:
                         pass
-                    logging.warning('GPU instantiation for %s=%s did not exhibit GPU usage; falling back', param_name, gpu_layers)
+                    logging.warning('GPU instantiation for %s=%s did not exhibit GPU usage; strict verification enabled, falling back', param_name, gpu_layers)
                     continue
 
                 # Record the successful GPU config on app.state for UI/status visibility
@@ -153,7 +184,9 @@ def create_llama_instance(model_path: str, verify_gpu: bool = False):
                     app.state.llm_last_gpu_param = param_name
                     app.state.llm_last_gpu_layers = gpu_layers
                     app.state.llm_has_gpu = True
-                    app.state.llm_gpu_verified = verified
+                    if verify_gpu:
+                        app.state.llm_gpu_verified = verified
+                    app.state.llm_gpu_init_failed = False
                 except Exception:
                     pass
                 logging.info('Instantiated Llama with GPU param %s=%s (verified=%s)', param_name, gpu_layers, bool(verified))
@@ -171,6 +204,7 @@ def create_llama_instance(model_path: str, verify_gpu: bool = False):
             app.state.llm_last_gpu_layers = None
             app.state.llm_has_gpu = False
             app.state.llm_gpu_verified = False
+            app.state.llm_gpu_init_failed = True
         except Exception:
             pass
         logging.warning('Tried GPU params %s but could not instantiate GPU-enabled Llama. Falling back to CPU.', tried)
@@ -184,20 +218,14 @@ def create_llama_instance(model_path: str, verify_gpu: bool = False):
         pass
     return Llama(**base_kwargs)
 
-# Prefer explicit import of the generative AI submodule if available
+# Prefer the new Google GenAI SDK
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
 except Exception as e:
-    logging.warning('Failed to import google.generativeai directly: %s', e)
-    # Fallback: the `google` package may expose a `generativeai` attribute
-    try:
-        import google as google_pkg
-        genai = getattr(google_pkg, 'generativeai', None)
-        if genai is None:
-            logging.error('google package imported but has no attribute generativeai')
-    except Exception as e2:
-        logging.error('Failed to import google package: %s', e2)
-        genai = None
+    logging.warning('Failed to import google.genai: %s', e)
+    genai = None
+    types = None
 
 APP_DIR = Path(__file__).resolve().parent
 PID_FILE = APP_DIR / '.llm_server_pid'
@@ -238,19 +266,22 @@ async def lifespan(app: FastAPI):
             app.state.llm_pool_max = int(os.environ.get('LLM_POOL_MAX', '2'))
             app.state.llm_pool_count = 0
             preload = int(os.environ.get('LLM_POOL_PRELOAD', '1'))
-            # Optionally preload a single instance (default: yes)
+            # Optionally preload a single instance (default: yes). Do not block startup.
             if preload and app.state.llm_pool_max > 0:
-                try:
-                    inst = create_llama_instance(model_path, verify_gpu=True)
-                    app.state.llm_pool.put_nowait(inst)
-                    app.state.llm_pool_count = 1
-                    # Keep this instance in app.state.llm for backwards compatibility
-                    app.state.llm = inst
-                    logging.info('Preloaded 1 Llama model from %s (pool max=%s, gpu=%s, verified=%s)', model_path, app.state.llm_pool_max, app.state.llm_use_gpu, getattr(app.state, 'llm_gpu_verified', False))
-                except Exception as e:
-                    logging.exception('Failed to preload Llama model: %s', e)
-                    app.state.llm_model_path = None
-                    app.state.llm = None
+                async def _preload():
+                    try:
+                        inst = await asyncio.to_thread(create_llama_instance, model_path, True)
+                        app.state.llm_pool.put_nowait(inst)
+                        app.state.llm_pool_count = getattr(app.state, 'llm_pool_count', 0) + 1
+                        # Keep this instance in app.state.llm for backwards compatibility
+                        app.state.llm = inst
+                        logging.info('Preloaded 1 Llama model from %s (pool max=%s, gpu=%s, verified=%s)', model_path, app.state.llm_pool_max, app.state.llm_use_gpu, getattr(app.state, 'llm_gpu_verified', False))
+                    except Exception as e:
+                        logging.exception('Failed to preload Llama model: %s', e)
+                        app.state.llm = None
+
+                app.state.llm_preload_task = asyncio.create_task(_preload())
+                logging.info('Scheduled async Llama preload (non-blocking).')
             else:
                 app.state.llm = None
 
@@ -266,23 +297,22 @@ async def lifespan(app: FastAPI):
 
     if genai and gemini_key:
         try:
-            genai.configure(api_key=gemini_key.strip())
             # Default to gemini-2.5-flash-lite
             app.state.gemini_model_name = GEMINI_MODEL_NAME
-            app.state.gemini_model = genai.GenerativeModel(app.state.gemini_model_name)
+            app.state.gemini_client = genai.Client(api_key=gemini_key.strip())
             logging.info('Gemini API initialized successfully with %s', app.state.gemini_model_name)
         except Exception as e:
             logging.exception('Failed to initialize Gemini: %s', e)
-            app.state.gemini_model = None
+            app.state.gemini_client = None
             app.state.gemini_init_error = str(e)
     else:
-        app.state.gemini_model = None
+        app.state.gemini_client = None
         if not gemini_key:
             msg = f'Gemini API key NOT found in environment. Check your .env file at {APP_DIR / ".env"}'
             logging.warning(msg)
             app.state.gemini_init_error = msg
         if not genai:
-            msg = 'google-generativeai package is not installed or failed to import.'
+            msg = 'google-genai package is not installed or failed to import.'
             logging.error(msg)
             app.state.gemini_init_error = (app.state.gemini_init_error or '') + ' ' + msg
 
@@ -646,20 +676,13 @@ def index():
     """
     # Compute LLM status for display
     llm = getattr(app.state, 'llm', None)
-    gemini = getattr(app.state, 'gemini_model', None)
+    gemini = getattr(app.state, 'gemini_client', None)
     if llm:
         provider = 'local'
     elif gemini:
         provider = getattr(app.state, 'gemini_model_name', GEMINI_MODEL_NAME)
     else:
         provider = ''
-    llm_url = os.environ.get('LLM_SERVER_URL', 'http://ashy.tplinkdns.com:5005/ask')
-
-    # Determine GPU display info
-    gpu_enabled = bool(getattr(app.state, 'llm_use_gpu', False))
-    gpu_param = getattr(app.state, 'llm_last_gpu_param', None)
-    gpu_layers = getattr(app.state, 'llm_last_gpu_layers', None)
-
     if provider:
         if provider == 'local':
             # Show a concise label: either GPU (if GPU is actually in use) or CPU ONLY
@@ -726,8 +749,11 @@ def index():
                 <div id="diag-last-test">Last test: <span id="diag-last-test-text">{last_diag_text}</span></div>
                 <div style="margin-top:6px;">
                     <button id="run-diag">Run GPU test</button>
+                    <span id="diag-status" style="margin-left:6px; color:#555;"></span>
                     <button id="run-autotune" style="margin-left:8px;">Auto-tune GPU</button>
+                    <span id="autotune-status" style="margin-left:6px; color:#555;"></span>
                     <button id="run-probe" style="margin-left:8px;">Run GPU probe</button>
+                    <span id="probe-status" style="margin-left:6px; color:#555;"></span>
                     <small style="color:#666; margin-left:8px;">(Auto-tune finds the largest safe GPU layer count; probe checks instance attributes and a short timing)</small>
                 </div>
                 <div style="margin-top:8px; font-family: monospace; font-size:0.92em; color:#222;"><pre id="autotune-log" style="white-space:pre-wrap; background:#fff; border:1px solid #ddd; padding:8px; max-height:200px; overflow:auto;">Autotune log...</pre></div>
@@ -741,10 +767,27 @@ def index():
     # Inject a small script to handle the Run GPU test button
     html = html.replace('</body>', '''
         <script>
-        document.getElementById('run-diag').addEventListener('click', async function () {
+        window.addEventListener('load', function () {
+        const diagBtn = document.getElementById('run-diag');
+        const autotuneBtn = document.getElementById('run-autotune');
+        const probeBtn = document.getElementById('run-probe');
+        const diagStatus = document.getElementById('diag-status');
+        const autotuneStatus = document.getElementById('autotune-status');
+        const probeStatus = document.getElementById('probe-status');
+        if (diagStatus) diagStatus.textContent = 'Ready';
+        if (autotuneStatus) autotuneStatus.textContent = 'Ready';
+        if (probeStatus) probeStatus.textContent = 'Ready';
+        if (!diagBtn || !autotuneBtn || !probeBtn) {
+            if (diagStatus) diagStatus.textContent = 'UI error: buttons not found';
+            return;
+        }
+
+        diagBtn.addEventListener('click', async function () {
             const btn = this;
             const textEl = document.getElementById('diag-last-test-text');
+            const statusEl = document.getElementById('diag-status');
             btn.disabled = true; textEl.textContent = 'Running test...';
+            statusEl.textContent = 'Working...';
             try {
                 const r = await fetch('/llm_diag', {method: 'POST'});
                 let j = {};
@@ -755,6 +798,7 @@ def index():
                 }
                 if (r.ok) {
                     textEl.textContent = `Result: ${j.ok ? 'OK' : 'FAIL'} ${j.param ? j.param+ '=' + j.layers : ''} Time: ${j.seconds ? j.seconds.toFixed(2)+'s' : ''} ${j.msg || ''}`;
+                    statusEl.textContent = 'Done';
                     // Update connection label if success
                     if (j.ok) {
                         const conn = document.getElementById('diag-connection');
@@ -762,22 +806,29 @@ def index():
                     }
                 } else {
                     textEl.textContent = 'Error: ' + r.status + ' ' + JSON.stringify(j);
+                    statusEl.textContent = 'Error';
                 }
             } catch (e) {
                 textEl.textContent = 'Request failed: ' + String(e);
+                statusEl.textContent = 'Error';
             } finally {
                 btn.disabled = false;
             }
         });
 
         // Auto-tune button - uses EventSource to stream progress
-        document.getElementById('run-autotune').addEventListener('click', function () {
+        autotuneBtn.addEventListener('click', function () {
             const btn = this;
             const log = document.getElementById('autotune-log');
+            const statusEl = document.getElementById('autotune-status');
             log.textContent = 'Starting autotune...\\n';
             btn.disabled = true;
+            statusEl.textContent = 'Connecting...';
             // Open EventSource (GET streaming endpoint)
             const es = new EventSource('/llm_autotune?stream=1&mode=fast'); // fast mode by default (coarse doubling only)
+            es.addEventListener('open', function() {
+                statusEl.textContent = 'Running...';
+            });
             es.addEventListener('progress', function(evt) {
                 try {
                     const d = JSON.parse(evt.data);
@@ -800,24 +851,30 @@ def index():
                         const textEl = document.getElementById('diag-last-test-text');
                         textEl.textContent = `Auto-tune result: ${d.recommended} layers (param ${d.param})`;
                     }
+                    statusEl.textContent = 'Done';
                 } catch (e) {
                     log.textContent += 'Malformed result: ' + evt.data + '\\n';
+                    statusEl.textContent = 'Error';
                 }
                 es.close();
                 btn.disabled = false;
             });
             es.addEventListener('error', function(evt) {
                 log.textContent += 'Autotune failed or closed.\\n';
+                statusEl.textContent = 'Error';
                 es.close();
                 btn.disabled = false;
             });
+        });
 
         // Probe button
-        document.getElementById('run-probe').addEventListener('click', async function () {
+        probeBtn.addEventListener('click', async function () {
             const btn = this;
             const plog = document.getElementById('probe-log');
+            const statusEl = document.getElementById('probe-status');
             plog.textContent = 'Running probe...';
             btn.disabled = true;
+            statusEl.textContent = 'Working...';
             try {
                 const r = await fetch('/llm_probe');
                 let j = {};
@@ -828,11 +885,14 @@ def index():
                 }
                 if (r.ok) {
                     plog.textContent = JSON.stringify(j, null, 2);
+                    statusEl.textContent = 'Done';
                 } else {
                     plog.textContent = 'Error: ' + r.status + ' ' + JSON.stringify(j);
+                    statusEl.textContent = 'Error';
                 }
             } catch (e) {
                 plog.textContent = 'Request failed: ' + String(e);
+                statusEl.textContent = 'Error';
             } finally {
                 btn.disabled = false;
             }
@@ -860,7 +920,7 @@ async def ask(request: Request, req: AskRequest):
     # - Accept shorthand 'gemini' and map to configured Gemini model name
     # - Treat 'gemma-*' and 'local' as local model requests
     req_prov = (req.provider or '').strip()
-    gemini_default = getattr(app.state, 'gemini_model', None)
+    gemini_default = getattr(app.state, 'gemini_client', None)
     # Whether a local model *could* be used (path configured and llama_cpp present)
     llm_available = (getattr(app.state, 'llm_model_path', None) is not None) and (Llama is not None)
     # Backwards compat: provide a convenience reference to any preloaded instance
@@ -871,8 +931,6 @@ async def ask(request: Request, req: AskRequest):
         provider = getattr(app.state, 'gemini_model_name', None) or GEMINI_MODEL_NAME
     else:
         provider = req_prov
-
-    original_provider = provider
 
     # Map gemma-* and explicit 'local' to local logic
     if provider.startswith('gemma-') or provider == 'local':
@@ -943,26 +1001,23 @@ async def ask(request: Request, req: AskRequest):
             # Fall back to server configuration or the GEMINI_MODEL_NAME env var
             model_name = getattr(app.state, 'gemini_model_name', None) or GEMINI_MODEL_NAME
 
-        # Convert history for Gemini
-        gemini_history = []
+        # Convert history for Gemini (Google GenAI SDK)
+        gemini_contents = []
         for m in messages:
-            if m['role'] != 'system':
-                role = 'user' if m['role'] == 'user' else 'model'
-                gemini_history.append({'role': role, 'parts': [m['content']]})
-        
-        user_msg = gemini_history.pop() if gemini_history and gemini_history[-1]['role'] == 'user' else {'role':'user', 'parts':[req.prompt]}
-        
-        try:
-            chat_model = genai.GenerativeModel(
-                model_name=model_name,
-                system_instruction=system_prompt
-            )
-            chat = chat_model.start_chat(history=gemini_history)
-        except Exception as e:
-            logging.error(f"Error initializing Gemini chat with model {model_name}: {e}")
-            # Fallback to default if specific failed? Or just error?
-            # Let's try to just raise for now or fallback if we were smart, but keep it simple.
-            raise HTTPException(status_code=500, detail=f"Gemini init error: {e}")
+            if m['role'] == 'system':
+                continue
+            role = 'user' if m['role'] == 'user' else 'model'
+            if types:
+                gemini_contents.append(
+                    types.Content(role=role, parts=[types.Part.from_text(text=m['content'])])
+                )
+            else:
+                gemini_contents.append({'role': role, 'parts': [{'text': m['content']}]})
+
+        # System instruction (if provided)
+        gemini_config = None
+        if types and system_prompt:
+            gemini_config = types.GenerateContentConfig(system_instruction=system_prompt)
 
         if stream_requested:
             async def gemini_stream():
@@ -970,7 +1025,12 @@ async def ask(request: Request, req: AskRequest):
                     yield f"event: provider\ndata: {provider}\n\n"
                     start = time.time()
                     final_text = ''
-                    response = await asyncio.to_thread(chat.send_message, user_msg['parts'][0], stream=True)
+                    response = await asyncio.to_thread(
+                        app.state.gemini_client.models.generate_content_stream,
+                        model=model_name,
+                        contents=gemini_contents,
+                        config=gemini_config,
+                    )
                     for chunk in response:
                         try:
                             if chunk.text:
@@ -991,7 +1051,12 @@ async def ask(request: Request, req: AskRequest):
         
         try:
             start = time.time()
-            response = await asyncio.to_thread(chat.send_message, user_msg['parts'][0])
+            response = await asyncio.to_thread(
+                app.state.gemini_client.models.generate_content,
+                model=model_name,
+                contents=gemini_contents,
+                config=gemini_config,
+            )
             elapsed = time.time() - start
             try:
                 text = response.text
@@ -1029,10 +1094,18 @@ async def ask(request: Request, req: AskRequest):
         if device_pref == 'gpu':
             if not llm_available:
                 raise HTTPException(status_code=500, detail='Local LLM not loaded')
-            # If server already has a verified GPU, proceed; otherwise attempt a one-off verified GPU instantiation
-            if not (getattr(app.state, 'llm_has_gpu', False) and getattr(app.state, 'llm_gpu_verified', False)):
+            # If server already has GPU, proceed (optionally requiring strict verification)
+            strict_verify = _gpu_verify_strict()
+            has_gpu = getattr(app.state, 'llm_has_gpu', False)
+            verified = getattr(app.state, 'llm_gpu_verified', False)
+            if not (has_gpu and (verified or not strict_verify)):
                 try:
-                    tmp_llm_inst = await asyncio.to_thread(create_llama_instance, app.state.llm_model_path, verify_gpu=True)
+                    tmp_llm_inst = await asyncio.to_thread(
+                        create_llama_instance,
+                        app.state.llm_model_path,
+                        verify_gpu=strict_verify,
+                        force_gpu=True,
+                    )
                     tmp_created = True
                 except Exception as e:
                     logging.warning('Per-request GPU verification failed: %s', str(e))
@@ -1051,7 +1124,7 @@ async def ask(request: Request, req: AskRequest):
                 if tmp_llm_inst is not None:
                     display_provider = 'GPU' if device_pref == 'gpu' else 'CPU ONLY'
                 else:
-                    display_provider = 'GPU' if getattr(app.state, 'llm_has_gpu', False) and getattr(app.state, 'llm_gpu_verified', False) and device_pref != 'cpu' else 'CPU ONLY'
+                    display_provider = 'GPU' if getattr(app.state, 'llm_has_gpu', False) and device_pref != 'cpu' else 'CPU ONLY'
                 yield f"event: provider\ndata: {display_provider}\n\n"
                 # Acquire a model instance for the duration of the stream
                 try:
@@ -1137,7 +1210,7 @@ async def ask(request: Request, req: AskRequest):
             if tmp_llm_inst is not None:
                 display_provider = 'GPU' if device_pref == 'gpu' else 'CPU ONLY'
             else:
-                display_provider = 'GPU' if getattr(app.state, 'llm_has_gpu', False) and getattr(app.state, 'llm_gpu_verified', False) and device_pref != 'cpu' else 'CPU ONLY'
+                display_provider = 'GPU' if getattr(app.state, 'llm_has_gpu', False) and device_pref != 'cpu' else 'CPU ONLY'
             return {'response': text, 'provider': display_provider, 'tokens': tokens_est, 'seconds': elapsed, 'tok_per_sec': tok_per_sec}
         except Exception as e:
             logging.exception('LLM generation error: %s', e)
@@ -1502,17 +1575,22 @@ async def gemini_test():
     request fails.
     """
     if genai is None:
-        raise HTTPException(status_code=500, detail='google-generativeai package not installed')
+        raise HTTPException(status_code=500, detail='google-genai package not installed')
     gemini_model_name = getattr(app.state, 'gemini_model_name', GEMINI_MODEL_NAME)
-    if not getattr(app.state, 'gemini_model', None):
+    if not getattr(app.state, 'gemini_client', None):
         raise HTTPException(status_code=500, detail='Gemini not initialized (missing API key or failed init)')
 
     try:
         def _call():
             # Use a very small request to test the service. Prefer the configured model name.
-            chat_model = genai.GenerativeModel(model_name=gemini_model_name, system_instruction='You are a helpful assistant.')
-            chat = chat_model.start_chat()
-            resp = chat.send_message('2+9')
+            config = None
+            if types:
+                config = types.GenerateContentConfig(system_instruction='You are a helpful assistant.')
+            resp = app.state.gemini_client.models.generate_content(
+                model=gemini_model_name,
+                contents='2+9',
+                config=config,
+            )
             # Try to extract text robustly
             text = ''
             try:
@@ -1538,7 +1616,7 @@ async def gemini_test():
 
 @app.get('/llm_status')
 def llm_status():
-    gemini = getattr(app.state, 'gemini_model', None)
+    gemini = getattr(app.state, 'gemini_client', None)
     llm_path = getattr(app.state, 'llm_model_path', None)
     pool_max = getattr(app.state, 'llm_pool_max', 0)
     pool_count = getattr(app.state, 'llm_pool_count', 0)
@@ -1586,6 +1664,19 @@ if __name__ == '__main__':
         import uvicorn
         uvicorn.run('llm_server:app', host=HOST, port=PORT, log_level='info')
 
+    def _resolve_python_executable():
+        # Prefer explicit env override, then local venv, then current interpreter
+        env_py = os.environ.get('LLM_PYTHON')
+        if env_py and Path(env_py).exists():
+            return env_py
+        venv_py = APP_DIR / 'venv' / 'bin' / 'python'
+        if venv_py.exists():
+            return str(venv_py)
+        venv_py3 = APP_DIR / 'venv' / 'bin' / 'python3'
+        if venv_py3.exists():
+            return str(venv_py3)
+        return sys.executable
+
     def start_background(logfile='/tmp/llm_server.log'):
         if PID_FILE.exists():
             try:
@@ -1595,7 +1686,8 @@ if __name__ == '__main__':
                 return
             except Exception:
                 pass
-        cmd = [sys.executable, str(__file__), 'start']
+        py = _resolve_python_executable()
+        cmd = [py, str(__file__), 'start']
         with open(logfile, 'ab') as out:
             p = subprocess.Popen(cmd, stdout=out, stderr=out, cwd=str(APP_DIR))
         time.sleep(0.5)
